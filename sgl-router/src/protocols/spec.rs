@@ -1804,6 +1804,94 @@ impl GenerationRequest for GenerateRequest {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAIServingRequest {
+    ChatCompletion(ChatCompletionRequest),
+    Completion(CompletionRequest),
+    Embedding(EmbeddingRequest),
+    // Add other types as they're implemented
+}
+
+// ==================================================================
+// =            Multimodal embedding                                              =
+// ==================================================================
+
+/// Multimodal embedding input support
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultimodalEmbeddingInput {
+    pub text: Option<String>,
+    pub image: Option<String>,
+}
+
+/// Union type for embedding input
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    IntegerTokens(Vec<i32>),
+    NestedIntegerTokens(Vec<Vec<i32>>),
+    Text(String),
+    TextArray(Vec<String>),
+    Multimodal(Vec<MultimodalEmbeddingInput>),
+}
+
+/// OpenAI-compatible embedding request
+/// Spec: https://platform.openai.com/docs/api-reference/embeddings/create
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    /// The input text to embed
+    pub input: EmbeddingInput,
+    
+    /// ID of the model to use
+    pub model: String,
+    
+    /// The format of the embedding output: "float" or "base64"
+    #[serde(default = "default_encoding_format")]
+    pub encoding_format: String,
+    
+    /// The number of dimensions the resulting output embeddings should have
+    pub dimensions: Option<i32>,
+    
+    /// A unique identifier representing your end-user
+    pub user: Option<String>,
+    
+    // SGLang specific extensions
+    /// Request ID for tracking
+    pub rid: Option<StringOrArray>,
+}
+
+fn default_encoding_format() -> String {
+    "float".to_string()
+}
+
+impl GenerationRequest for EmbeddingRequest {
+    /// Extract text content for routing decisions
+    fn extract_text_for_routing(&self) -> String {
+        match &self.input {
+            EmbeddingInput::Text(text) => return text.clone(),
+            EmbeddingInput::TextArray(texts) => return texts.join(" "),
+            EmbeddingInput::IntegerTokens(_) => return String::new(),
+            EmbeddingInput::NestedIntegerTokens(_) => return String::new(),
+            EmbeddingInput::Multimodal(inputs) => {
+                return inputs
+                    .iter()
+                    .filter_map(|input| input.text.as_ref())
+                    .cloned()
+                    .collect::<Vec<String>>()
+                    .join(" ")
+            }
+        }
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+    
+    fn is_stream(&self) -> bool {
+        false // Embeddings don't support streaming
+    }
+}
+
 // ==================================================================
 // =            COMMON                                              =
 // ==================================================================
@@ -1826,7 +1914,7 @@ pub trait GenerationRequest: Send + Sync {
 }
 
 /// Helper type for string or array of strings
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum StringOrArray {
     String(String),
@@ -1864,4 +1952,302 @@ impl StringOrArray {
 pub enum LoRAPath {
     Single(Option<String>),
     Batch(Vec<Option<String>>),
+}
+
+// ==================================================================
+// =                           TESTS                                =
+// ==================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ============= EmbeddingInput Tests =============
+    
+    #[test]
+    fn test_embedding_input_string_deserialization() {
+        let json_str = r#""Hello, world!""#;
+        let input: EmbeddingInput = serde_json::from_str(json_str).unwrap();
+        
+        match input {
+            EmbeddingInput::Text(s) => assert_eq!(s, "Hello, world!"),
+            _ => panic!("Expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_string_array_deserialization() {
+        let json_str = r#"["Hello", "World", "Test"]"#;
+        let input: EmbeddingInput = serde_json::from_str(json_str).unwrap();
+        
+        match input {
+            EmbeddingInput::TextArray(arr) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], "Hello");
+                assert_eq!(arr[1], "World");
+                assert_eq!(arr[2], "Test");
+            }
+            _ => panic!("Expected TextArray variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_integer_tokens_deserialization() {
+        let json_str = r#"[101, 102, 103, 104]"#;
+        let input: EmbeddingInput = serde_json::from_str(json_str).unwrap();
+        
+        match input {
+            EmbeddingInput::IntegerTokens(tokens) => {
+                assert_eq!(tokens, vec![101, 102, 103, 104]);
+            }
+            _ => panic!("Expected IntegerTokens variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_nested_integer_tokens_deserialization() {
+        let json_str = r#"[[101, 102], [103, 104], [105, 106]]"#;
+        let input: EmbeddingInput = serde_json::from_str(json_str).unwrap();
+        
+        match input {
+            EmbeddingInput::NestedIntegerTokens(batches) => {
+                assert_eq!(batches.len(), 3);
+                assert_eq!(batches[0], vec![101, 102]);
+                assert_eq!(batches[1], vec![103, 104]);
+                assert_eq!(batches[2], vec![105, 106]);
+            }
+            _ => panic!("Expected NestedIntegerTokens variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_multimodal_deserialization() {
+        let json_str = r#"[
+            {"text": "First text", "image": "base64_image_1"},
+            {"text": "Second text"},
+            {"image": "base64_image_2"}
+        ]"#;
+        let input: EmbeddingInput = serde_json::from_str(json_str).unwrap();
+        
+        match input {
+            EmbeddingInput::Multimodal(inputs) => {
+                assert_eq!(inputs.len(), 3);
+                
+                assert_eq!(inputs[0].text, Some("First text".to_string()));
+                assert_eq!(inputs[0].image, Some("base64_image_1".to_string()));
+                
+                assert_eq!(inputs[1].text, Some("Second text".to_string()));
+                assert_eq!(inputs[1].image, None);
+                
+                assert_eq!(inputs[2].text, None);
+                assert_eq!(inputs[2].image, Some("base64_image_2".to_string()));
+            }
+            _ => panic!("Expected Multimodal variant"),
+        }
+    }
+
+    // ============= EmbeddingRequest Tests =============
+    
+    #[test]
+    fn test_embedding_request_minimal() {
+        let json_str = r#"{
+            "input": "Test embedding",
+            "model": "text-embedding-ada-002"
+        }"#;
+        
+        let request: EmbeddingRequest = serde_json::from_str(json_str).unwrap();
+        assert_eq!(request.model, "text-embedding-ada-002");
+        assert_eq!(request.encoding_format, "float"); // default value
+        assert_eq!(request.dimensions, None);
+        assert_eq!(request.user, None);
+        assert_eq!(request.rid, None);
+    }
+
+    #[test]
+    fn test_embedding_request_full() {
+        let json_str = r#"{
+            "input": ["text1", "text2"],
+            "model": "text-embedding-3-small",
+            "encoding_format": "base64",
+            "dimensions": 512,
+            "user": "user123",
+            "rid": "request_456"
+        }"#;
+        
+        let request: EmbeddingRequest = serde_json::from_str(json_str).unwrap();
+        assert_eq!(request.model, "text-embedding-3-small");
+        assert_eq!(request.encoding_format, "base64");
+        assert_eq!(request.dimensions, Some(512));
+        assert_eq!(request.user, Some("user123".to_string()));
+        
+        match request.rid {
+            Some(StringOrArray::String(id)) => assert_eq!(id, "request_456"),
+            _ => panic!("Expected rid to be String variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_request_serialization() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("Test text".to_string()),
+            model: "text-embedding-ada-002".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: Some(256),
+            user: Some("test_user".to_string()),
+            rid: Some(StringOrArray::Array(vec!["id1".to_string(), "id2".to_string()])),
+        };
+        
+        let json = serde_json::to_value(&request).unwrap();
+        
+        assert_eq!(json["input"], "Test text");
+        assert_eq!(json["model"], "text-embedding-ada-002");
+        assert_eq!(json["encoding_format"], "float");
+        assert_eq!(json["dimensions"], 256);
+        assert_eq!(json["user"], "test_user");
+        assert_eq!(json["rid"], json!(["id1", "id2"]));
+    }
+
+    #[test]
+    fn test_embedding_request_with_batch_rid() {
+        let json_str = r#"{
+            "input": ["text1", "text2", "text3"],
+            "model": "text-embedding-ada-002",
+            "rid": ["rid1", "rid2", "rid3"]
+        }"#;
+        
+        let request: EmbeddingRequest = serde_json::from_str(json_str).unwrap();
+        
+        match request.rid {
+            Some(StringOrArray::Array(ids)) => {
+                assert_eq!(ids.len(), 3);
+                assert_eq!(ids[0], "rid1");
+                assert_eq!(ids[1], "rid2");
+                assert_eq!(ids[2], "rid3");
+            }
+            _ => panic!("Expected rid to be Array variant"),
+        }
+    }
+
+    // ============= extract_text_for_routing Tests =============
+    
+    #[test]
+    fn test_extract_text_for_routing_string() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("Sample text for routing".to_string()),
+            model: "test".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+        
+        assert_eq!(request.extract_text_for_routing(), "Sample text for routing");
+    }
+
+    #[test]
+    fn test_extract_text_for_routing_array() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::TextArray(vec![
+                "First".to_string(),
+                "Second".to_string(),
+                "Third".to_string(),
+            ]),
+            model: "test".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+        
+        assert_eq!(request.extract_text_for_routing(), "First Second Third");
+    }
+
+    #[test]
+    fn test_extract_text_for_routing_tokens() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::IntegerTokens(vec![1, 2, 3]),
+            model: "test".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+        
+        assert_eq!(request.extract_text_for_routing(), "");
+    }
+
+    #[test]
+    fn test_extract_text_for_routing_multimodal() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Multimodal(vec![
+                MultimodalEmbeddingInput {
+                    text: Some("Text 1".to_string()),
+                    image: Some("image1".to_string()),
+                },
+                MultimodalEmbeddingInput {
+                    text: Some("Text 2".to_string()),
+                    image: None,
+                },
+                MultimodalEmbeddingInput {
+                    text: None,
+                    image: Some("image2".to_string()),
+                },
+            ]),
+            model: "test".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+        
+        assert_eq!(request.extract_text_for_routing(), "Text 1 Text 2");
+    }
+
+    // ============= GenerationRequest Trait Tests =============
+    
+    #[test]
+    fn test_generation_request_trait_implementation() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("Test".to_string()),
+            model: "embedding-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+        
+        // Test trait methods
+        assert_eq!(request.is_stream(), false);
+        assert_eq!(request.get_model(), Some("embedding-model"));
+        assert_eq!(request.extract_text_for_routing(), "Test");
+    }
+
+    // ============= OpenAIServingRequest Tests =============
+    
+    #[test]
+    fn test_openai_serving_request_embedding_variant() {
+        let json_str = r#"{
+            "input": "Test embedding",
+            "model": "text-embedding-ada-002"
+        }"#;
+        
+        let request: OpenAIServingRequest = serde_json::from_str(json_str).unwrap();
+        
+        match request {
+            OpenAIServingRequest::Embedding(embed_req) => {
+                assert_eq!(embed_req.model, "text-embedding-ada-002");
+                match embed_req.input {
+                    EmbeddingInput::Text(s) => assert_eq!(s, "Test embedding"),
+                    _ => panic!("Expected Text input"),
+                }
+            }
+            _ => panic!("Expected Embedding variant"),
+        }
+    }
+
+    #[test]
+    fn test_default_encoding_format() {
+        assert_eq!(default_encoding_format(), "float");
+    }
 }

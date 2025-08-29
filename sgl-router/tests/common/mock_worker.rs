@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use base64::Engine;
 use futures_util::stream::{self, StreamExt};
 use serde_json::json;
 use std::convert::Infallible;
@@ -81,6 +82,7 @@ impl MockWorker {
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/v1/embeddings", post(embeddings_handler))
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
@@ -597,6 +599,111 @@ async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) 
             "created": timestamp,
             "owned_by": "organization-owner"
         }]
+    }))
+    .into_response()
+}
+
+async fn embeddings_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Internal server error during embedding generation",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    let model = payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text-embedding-ada-002");
+
+    let encoding_format = payload
+        .get("encoding_format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("float");
+
+    let dimensions = payload.get("dimensions").and_then(|v| v.as_u64()).unwrap_or(1536) as usize;
+
+    // Determine batch size based on input type
+    let batch_size = match payload.get("input") {
+        Some(input) => {
+            if input.is_array() {
+                let array = input.as_array().unwrap();
+                
+                // Check if it's a nested array (batch) or flat array (single tokens)
+                if !array.is_empty() {
+                    if array[0].is_array() {
+                        // This is a batch of token arrays: [[1,2,3], [4,5,6]]
+                        array.len()
+                    } else if array.iter().all(|v| v.is_number()) {
+                        // This is a single token array: [1,2,3,4]
+                        1
+                    } else {
+                        // This is a batch of strings: ["text1", "text2"]
+                        array.len()
+                    }
+                } else {
+                    1
+                }
+            } else {
+                1
+            }
+        }
+        None => 1,
+    };
+
+    // Generate mock embeddings
+    let mut data = Vec::new();
+    for i in 0..batch_size {
+        let embedding_data = if encoding_format == "base64" {
+            // Generate mock base64 encoded embedding
+            let mock_floats: Vec<f32> = (0..dimensions).map(|j| ((i + j) as f32) / 1000.0).collect();
+            let bytes: Vec<u8> = mock_floats.iter().flat_map(|f| f.to_le_bytes()).collect();
+            json!(base64::engine::general_purpose::STANDARD.encode(&bytes))
+        } else {
+            // Generate mock float embedding
+            let embedding: Vec<f32> = (0..dimensions).map(|j| ((i + j) as f32) / 1000.0).collect();
+            json!(embedding)
+        };
+
+        data.push(json!({
+            "object": "embedding",
+            "index": i,
+            "embedding": embedding_data
+        }));
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Calculate mock token usage
+    let prompt_tokens = batch_size * 10; // Mock: ~10 tokens per input
+
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens
+        }
     }))
     .into_response()
 }

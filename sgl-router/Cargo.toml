@@ -76,6 +76,7 @@ http-body-util = "0.1"
 portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
+base64 = "0.22"
 
 [[bench]]
 name = "request_processing"
