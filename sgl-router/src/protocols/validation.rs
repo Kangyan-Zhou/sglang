@@ -9,6 +9,8 @@ use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, ResponseFormat, StringOrArray, UserMessageContent,
 };
 
+use crate::protocols::spec::{EmbeddingRequest, EmbeddingInput};
+
 /// Validation constants for OpenAI API parameters
 pub mod constants {
     /// Temperature range: 0.0 to 2.0 (OpenAI spec)
@@ -751,6 +753,38 @@ impl ValidatableRequest for ChatCompletionRequest {
         self.validate_chat_cross_parameters()?;
 
         Ok(())
+    }
+}
+
+impl EmbeddingRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate encoding format
+        if !["float", "base64"].contains(&self.encoding_format.as_str()) {
+            return Err(format!("Invalid encoding format: {}", self.encoding_format));
+        }
+        
+        // Validate dimensions if specified
+        if let Some(dims) = self.dimensions {
+            if dims <= 0 {
+                return Err("Dimensions must be positive".to_string());
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Convert input to appropriate format for processing
+    pub fn normalize_input(&self) -> Vec<String> {
+        match &self.input {
+            EmbeddingInput::Text(s) => vec![s.clone()],
+            EmbeddingInput::TextArray(arr) => arr.clone(),
+            EmbeddingInput::Multimodal(items) => {
+                items.iter()
+                    .filter_map(|item| item.text.clone())
+                    .collect()
+            },
+            _ => vec![], // Token inputs need tokenizer handling
+        }
     }
 }
 
