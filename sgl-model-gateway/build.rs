@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rebuild triggers
     println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
     println!("cargo:rerun-if-changed=src/proto/vllm_engine.proto");
+    println!("cargo:rerun-if-changed=src/proto/internal_router.proto");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
     // Compile protobuf files
@@ -26,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "src/proto/sglang_scheduler.proto",
                 "src/proto/vllm_engine.proto",
+                "src/proto/internal_router.proto",
             ],
             &["src/proto"],
         )?;

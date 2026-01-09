@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package sglang.grpc.internal_router;
+
+import "google/protobuf/struct.proto";
+
+// Internal Router Service for pre-tokenized requests from Tokenizer tier
+// This service is NOT exposed to clients - only used for Tokenizer → Router communication
+service InternalRouter {
+  // Route a pre-tokenized chat completion request
+  rpc RouteChatCompletion(PreTokenizedChatRequest) returns (stream RouteResponse);
+
+  // Route a pre-tokenized generate request
+  rpc RouteGenerate(PreTokenizedGenerateRequest) returns (stream RouteResponse);
+
+  // Route a pre-tokenized embedding request
+  rpc RouteEmbedding(PreTokenizedEmbeddingRequest) returns (RouteResponse);
+
+  // Route a pre-tokenized classification request
+  rpc RouteClassify(PreTokenizedClassifyRequest) returns (RouteResponse);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// =====================
+// Pre-Tokenized Requests
+// =====================
+
+// Pre-tokenized chat completion request from Tokenizer tier
+message PreTokenizedChatRequest {
+  // Request identification
+  string request_id = 1;
+  string model_id = 2;
+
+  // Pre-computed tokenization results
+  TokenizationResult tokenization = 3;
+
+  // Original request body (JSON bytes) for forwarding to worker
+  bytes original_request_body = 4;
+
+  // Pass-through headers for routing decisions
+  map<string, string> headers = 5;
+
+  // Whether to stream the response
+  bool stream = 6;
+}
+
+// Pre-tokenized generate request from Tokenizer tier
+message PreTokenizedGenerateRequest {
+  string request_id = 1;
+  string model_id = 2;
+  TokenizationResult tokenization = 3;
+  bytes original_request_body = 4;
+  map<string, string> headers = 5;
+  bool stream = 6;
+}
+
+// Pre-tokenized embedding request from Tokenizer tier
+message PreTokenizedEmbeddingRequest {
+  string request_id = 1;
+  string model_id = 2;
+  TokenizationResult tokenization = 3;
+  bytes original_request_body = 4;
+  map<string, string> headers = 5;
+}
+
+// Pre-tokenized classification request from Tokenizer tier
+message PreTokenizedClassifyRequest {
+  string request_id = 1;
+  string model_id = 2;
+  TokenizationResult tokenization = 3;
+  bytes original_request_body = 4;
+  map<string, string> headers = 5;
+}
+
+// =====================
+// Tokenization Result
+// =====================
+
+// Result of tokenization performed by Tokenizer tier
+message TokenizationResult {
+  // Token IDs from tokenization
+  repeated uint32 token_ids = 1;
+
+  // Processed text after chat template applied (used for radix tree routing)
+  string processed_text = 2;
+
+  // Token count for load estimation
+  int32 token_count = 3;
+
+  // Original text before chat template (for reference)
+  string original_text = 4;
+}
+
+// =====================
+// Route Response
+// =====================
+
+message RouteResponse {
+  oneof response {
+    // Streaming chunk (for streaming responses)
+    StreamChunk chunk = 1;
+
+    // Final complete response
+    bytes complete_response = 2;
+
+    // Error response
+    RouteError error = 3;
+  }
+}
+
+message StreamChunk {
+  // Raw chunk data to forward to client
+  bytes data = 1;
+
+  // Whether this is the final chunk
+  bool is_final = 2;
+}
+
+message RouteError {
+  string code = 1;
+  string message = 2;
+  int32 http_status = 3;
+  string details = 4;
+}
+
+// =====================
+// Health Check
+// =====================
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string message = 2;
+
+  // Router-specific health info
+  int32 available_workers = 3;
+  int32 total_workers = 4;
+  bool mesh_connected = 5;
+}
