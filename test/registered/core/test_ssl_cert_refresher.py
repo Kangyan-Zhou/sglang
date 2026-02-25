@@ -5,11 +5,10 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=1, suite="stage-b-test-small-1-gpu-amd")
+register_cpu_ci(est_time=9, suite="stage-a-cpu-only")
 
 
 def _make_temp_pem(content: bytes) -> str:
