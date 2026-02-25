@@ -314,6 +314,7 @@ class ServerArgs:
     ssl_certfile: Optional[str] = None
     ssl_ca_certs: Optional[str] = None
     ssl_keyfile_password: Optional[str] = None
+    enable_ssl_refresh: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -868,6 +869,11 @@ class ServerArgs:
             raise ValueError(
                 f"SSL CA certificates file not found: '{self.ssl_ca_certs}'. "
                 f"Please check the --ssl-ca-certs path."
+            )
+        if self.enable_ssl_refresh and not (self.ssl_certfile and self.ssl_keyfile):
+            raise ValueError(
+                "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
+                "to be specified."
             )
 
     def _handle_deprecated_args(self):
@@ -3294,6 +3300,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.ssl_keyfile_password,
             help="The password to decrypt the SSL keyfile.",
+        )
+        parser.add_argument(
+            "--enable-ssl-refresh",
+            action="store_true",
+            default=ServerArgs.enable_ssl_refresh,
+            help="Enable automatic SSL certificate hot-reloading when cert/key "
+            "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
         )
 
         # Quantization and data type

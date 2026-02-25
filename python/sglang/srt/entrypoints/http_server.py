@@ -2071,19 +2071,56 @@ def launch_server(
 
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:
-            # Default case, one tokenizer process
-            uvicorn.run(
-                app,
-                fd=reserved_socket.fileno(),
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-                ssl_keyfile=server_args.ssl_keyfile,
-                ssl_certfile=server_args.ssl_certfile,
-                ssl_ca_certs=server_args.ssl_ca_certs,
-                ssl_keyfile_password=server_args.ssl_keyfile_password,
-            )
+            if server_args.enable_ssl_refresh:
+                # Use Config/Server API for access to the SSLContext.
+                config = uvicorn.Config(
+                    app,
+                    fd=reserved_socket.fileno(),
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=5,
+                    loop="uvloop",
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
+                config.load()  # Creates the SSLContext
+
+                from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
+
+                server = uvicorn.Server(config)
+
+                async def _run_with_ssl_refresh():
+                    refresher = SSLCertRefresher(
+                        config.ssl,
+                        server_args.ssl_keyfile,
+                        server_args.ssl_certfile,
+                        server_args.ssl_ca_certs,
+                    )
+                    logger.info("SSL certificate auto-refresh enabled.")
+                    try:
+                        await server.serve()
+                    finally:
+                        refresher.stop()
+
+                import asyncio
+
+                asyncio.run(_run_with_ssl_refresh())
+            else:
+                # Default case, one tokenizer process
+                uvicorn.run(
+                    app,
+                    fd=reserved_socket.fileno(),
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=5,
+                    loop="uvloop",
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
         else:
             # Multiple tokenizer and http processes
             from uvicorn.config import LOGGING_CONFIG
@@ -2094,6 +2131,13 @@ def launch_server(
                 "propagate": False,
             }
             monkey_patch_uvicorn_multiprocessing()
+
+            if server_args.enable_ssl_refresh:
+                logger.warning(
+                    "--enable-ssl-refresh is not supported with multiple "
+                    "tokenizer workers (--tokenizer-worker-num > 1). "
+                    "SSL refresh will be disabled."
+                )
 
             uvicorn.run(
                 "sglang.srt.entrypoints.http_server:app",

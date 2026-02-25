@@ -403,6 +403,41 @@ class TestSSLArgs(unittest.TestCase):
         )
         self.assertEqual(server_args.url(), "https://[::1]:30000")
 
+    def test_enable_ssl_refresh_default_false(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertFalse(server_args.enable_ssl_refresh)
+
+    def test_enable_ssl_refresh_without_ssl_raises(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", enable_ssl_refresh=True)
+        self.assertIn("--enable-ssl-refresh", str(context.exception))
+        self.assertIn("--ssl-certfile", str(context.exception))
+
+    @patch("os.path.isfile", return_value=True)
+    def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):
+        server_args = ServerArgs(
+            model_path="dummy",
+            ssl_keyfile="key.pem",
+            ssl_certfile="cert.pem",
+            enable_ssl_refresh=True,
+        )
+        self.assertTrue(server_args.enable_ssl_refresh)
+
+    @patch("os.path.isfile", return_value=True)
+    def test_enable_ssl_refresh_cli_flag(self, _mock_isfile):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--ssl-keyfile",
+                "key.pem",
+                "--ssl-certfile",
+                "cert.pem",
+                "--enable-ssl-refresh",
+            ]
+        )
+        self.assertTrue(server_args.enable_ssl_refresh)
+
 
 if __name__ == "__main__":
     unittest.main()
