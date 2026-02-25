@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -42,7 +43,12 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -299,6 +305,8 @@ class PrefillBootstrapQueue:
                 continue
 
             # KV.WaitingForInput - init here
+            if req.time_stats.bootstrap_done_time == 0.0:
+                req.time_stats.bootstrap_done_time = time.perf_counter()
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
@@ -596,6 +604,65 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
+
+        if self.enable_metrics:
+            page_size = self.token_to_kv_pool_allocator.page_size
+            kv_item_lens = (
+                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.kv_item_lens
+            )
+            bytes_per_page_all_layers = sum(kv_item_lens)
+
+            for req in done_reqs:
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    continue
+                ts = req.time_stats
+
+                # Transfer latency, size, and speed
+                if ts.prefill_transfer_queue_entry_time > 0 and ts.completion_time > 0:
+                    transfer_latency_s = (
+                        ts.completion_time - ts.prefill_transfer_queue_entry_time
+                    )
+                    latency_ms = transfer_latency_s * 1000
+
+                    # Transfer size
+                    num_tokens = len(req.origin_input_ids)
+                    num_pages = kv_to_page_num(num_tokens, page_size)
+                    total_bytes = bytes_per_page_all_layers * num_pages
+                    total_mb = total_bytes / (1024 * 1024)
+                    ts.transfer_total_mb = total_mb
+
+                    # Transfer speed
+                    speed_gb_s = 0.0
+                    if transfer_latency_s > 0:
+                        speed_gb_s = (total_mb / 1024) / transfer_latency_s
+                        ts.transfer_speed_gb_s = speed_gb_s
+
+                    # Update last-value for REST API
+                    self.kv_transfer_latency_ms = latency_ms
+                    self.kv_transfer_speed_gb_s = speed_gb_s
+
+                    self.metrics_collector.observe_kv_transfer_metrics(
+                        latency_ms=latency_ms,
+                        total_mb=total_mb,
+                        speed_gb_s=speed_gb_s,
+                    )
+
+                # Bootstrap and alloc durations
+                if (
+                    ts.prefill_bootstrap_queue_entry_time > 0
+                    and ts.bootstrap_done_time > 0
+                    and ts.wait_queue_entry_time > 0
+                ):
+                    bootstrap_ms = (
+                        ts.bootstrap_done_time - ts.prefill_bootstrap_queue_entry_time
+                    ) * 1000
+                    alloc_ms = (
+                        ts.wait_queue_entry_time - ts.bootstrap_done_time
+                    ) * 1000
+                    self.metrics_collector.observe_kv_transfer_bootstrap(
+                        bootstrap_ms=bootstrap_ms,
+                        alloc_ms=alloc_ms,
+                    )
 
         # Stream requests which have finished transfer
         self.stream_output(

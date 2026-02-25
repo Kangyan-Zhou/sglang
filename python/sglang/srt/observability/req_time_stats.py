@@ -547,6 +547,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     decode_transfer_queue_entry_time: float = 0.0
     decode_prebuilt_finish_time: float = 0.0
 
+    # bootstrap sub-phase tracking (PD disagg)
+    bootstrap_done_time: float = 0.0
+
     # only for request tracing
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
