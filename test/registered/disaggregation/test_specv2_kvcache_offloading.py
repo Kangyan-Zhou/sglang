@@ -15,9 +15,9 @@ import torch
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cpu_ci(est_time=10, suite="stage-a-cpu-only")
+register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
 
 
 def _make_mock_req(
