@@ -21,35 +21,21 @@ Investigate a consistently failing CI test to find the root cause - whether it's
 
 If SSH target and docker container are not provided, the skill will only perform the CI log analysis and bisection, without remote reproduction. **Ask the user** for these if reproduction is needed and they weren't provided.
 
-## Background: Scheduled CI Runs
-
-SGLang uses the `pr-test.yml` workflow with **scheduled runs** (cron-triggered) to periodically test the `main` branch. These runs are the primary data source for detecting regressions:
-
-- **Workflow**: `pr-test.yml` with `event: schedule`
-- **Branch**: `main`
-- **Dashboard**: https://github.com/sgl-project/sglang/actions/workflows/pr-test.yml?query=event%3Aschedule
-- **Frequency**: Runs multiple times daily, each pinned to the HEAD of `main` at trigger time
-- **Purpose**: Catches regressions that slip through PR-level CI (e.g., interaction bugs between merged PRs, hardware-specific issues)
-
-Always use these scheduled runs (not PR-triggered runs) when bisecting regressions on `main`. The `--event schedule` filter in `gh run list` ensures you only see these periodic main-branch runs.
-
 ## Workflow
 
 ### Phase 1: Extract the Failure Signature
 
-1. **Get the failing test details from CI logs.** If given a URL, fetch logs directly. If given a test name, find recent scheduled runs of `pr-test.yml` on `main` that failed:
+1. **Get the failing test details from CI logs.** If given a URL, fetch logs directly. If given a test name, find recent schedule runs that failed:
 
 ```bash
-# List recent scheduled runs targeting main (the primary source of truth for regressions)
-# These are cron-triggered runs visible at:
-# https://github.com/sgl-project/sglang/actions/workflows/pr-test.yml?query=event%3Aschedule
-gh run list --repo sgl-project/sglang --workflow="pr-test.yml" --event schedule --branch main --limit 20 --json databaseId,conclusion,createdAt,headSha
+# List recent scheduled runs
+gh run list --workflow="pr-test.yml" --event schedule --branch main --limit 20 --json databaseId,conclusion,createdAt,headSha
 
 # Find the job containing the test
-gh run view {RUN_ID} --repo sgl-project/sglang --json jobs --jq '.jobs[] | select(.conclusion == "failure") | {name, conclusion, databaseId}'
+gh run view {RUN_ID} --json jobs --jq '.jobs[] | select(.conclusion == "failure") | {name, conclusion, databaseId}'
 
 # Get the failure details
-gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -E -B 5 -A 30 "AssertionError|FAIL|Error|{TEST_NAME}"
+gh run view {RUN_ID} --job {JOB_ID} --log 2>&1 | grep -B 5 -A 30 "AssertionError\|FAIL\|Error\|{TEST_NAME}"
 ```
 
 2. **Record the failure signature:**
@@ -61,16 +47,16 @@ gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep 
 
 ### Phase 2: Temporal Bisection
 
-3. **Find the boundary between passing and failing runs.** Walk through the scheduled run history (from the `pr-test.yml` schedule runs on `main`) to identify:
+3. **Find the boundary between passing and failing runs.** Check the schedule run history to identify:
    - Last known PASSING run (sha + date)
    - First known FAILING run (sha + date)
 
 ```bash
-# For each scheduled run, check the specific partition/job status
-gh run view {RUN_ID} --repo sgl-project/sglang --json jobs --jq '.jobs[] | select(.name == "{JOB_NAME}") | {conclusion, databaseId}'
+# For each run, check the specific partition/job status
+gh run view {RUN_ID} --json jobs --jq '.jobs[] | select(.name == "{JOB_NAME}") | {conclusion, databaseId}'
 
 # Verify a specific test passed or failed in a run
-gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -E "{TEST_NAME}|PASSED|FAILED|logprobs mismatch" | head -10
+gh run view {RUN_ID} --job {JOB_ID} --log 2>&1 | grep -E "{TEST_NAME}|PASSED|FAILED|logprobs mismatch" | head -10
 ```
 
 4. **List commits between the boundary:**
@@ -91,13 +77,13 @@ git log --oneline {LAST_PASS_SHA}..{FIRST_FAIL_SHA} -- {relevant_paths}
 
 ```bash
 # Get runner name and machine
-gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -E "Runner name|Machine name" | head -5
+gh run view {RUN_ID} --job {JOB_ID} --log 2>&1 | grep -E "Runner name|Machine name" | head -5
 
 # Get GPU/driver info
-gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -i -E "NVIDIA-SMI|Driver Version|CUDA Version" | head -5
+gh run view {RUN_ID} --job {JOB_ID} --log 2>&1 | grep -i "NVIDIA-SMI\|Driver Version\|CUDA Version" | head -5
 
 # Get package versions
-gh run view {RUN_ID} --repo sgl-project/sglang --job {JOB_ID} --log 2>&1 | grep -E "sgl.kernel.*==|flashinfer.*==" | head -5
+gh run view {RUN_ID} --job {JOB_ID} --log 2>&1 | grep -E "sgl.kernel.*==|flashinfer.*==" | head -5
 ```
 
 7. **Correlate runners with pass/fail outcomes.** Build a table:
@@ -136,9 +122,9 @@ ssh {SSH_TARGET} "docker exec {CONTAINER} pip show sgl-kernel sglang flashinfer-
 ```bash
 # Try fetching latest main
 ssh {SSH_TARGET} "docker exec {CONTAINER} bash -c 'cd /path/to/sglang && git fetch origin main && git checkout origin/main'"
-# Or download and install from tarball if git auth fails
-ssh {SSH_TARGET} "docker exec {CONTAINER} bash -c 'cd /tmp && curl -L https://github.com/sgl-project/sglang/archive/refs/heads/main.tar.gz | tar xz && cd sglang-main && pip install -e \"python[all]\"'"
-# Reinstall (after git fetch)
+# Or download tarball if git auth fails
+ssh {SSH_TARGET} "docker exec {CONTAINER} bash -c 'curl -L https://github.com/sgl-project/sglang/archive/refs/heads/main.tar.gz -o /tmp/sglang-main.tar.gz && cd /tmp && tar xzf sglang-main.tar.gz'"
+# Reinstall
 ssh {SSH_TARGET} "docker exec {CONTAINER} bash -c 'cd /path/to/sglang && pip install -e \"python[all]\"'"
 # Install test dependencies if needed
 ssh {SSH_TARGET} "docker exec {CONTAINER} pip install peft rouge-score"
