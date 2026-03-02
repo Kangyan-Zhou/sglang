@@ -126,6 +126,24 @@ def parse_args():
         default="",
         help="Tag of a certain run in the log file",
     )
+    parser.add_argument(
+        "--min-rounds",
+        type=int,
+        default=0,
+        help="Min rounds per client (0 = use --num-rounds)",
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=0,
+        help="Max rounds per client (0 = use --num-rounds)",
+    )
+    parser.add_argument(
+        "--range-ratio",
+        type=float,
+        default=1.0,
+        help="Length variation ratio for prompts and outputs (1.0 = no variation, 0.5 = 50%% variation)",
+    )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--lora-path",
@@ -186,34 +204,76 @@ class WorkloadGenerator:
         self.request_rate = args.request_rate
         self.start_time = None
         self.finished_time = None
+        self.lora_path = args.lora_path
 
         self.sent_requests = 0
         self.completed_requests = 0
 
+        # Resolve per-client round counts
+        min_rounds = args.min_rounds
+        max_rounds = args.max_rounds
+        if min_rounds == 0 and max_rounds == 0:
+            # Backward compat: all clients use --num-rounds
+            min_rounds = args.num_rounds
+            max_rounds = args.num_rounds
+        elif min_rounds == 0:
+            min_rounds = max_rounds
+        elif max_rounds == 0:
+            max_rounds = min_rounds
+        if min_rounds < 1:
+            raise ValueError(f"--min-rounds must be >= 1, got {min_rounds}")
+        if min_rounds > max_rounds:
+            raise ValueError(
+                f"--min-rounds ({min_rounds}) must be <= --max-rounds ({max_rounds})"
+            )
+
+        self.min_rounds = min_rounds
+        self.max_rounds = max_rounds
+
+        if min_rounds == max_rounds:
+            # All clients have the same round count; skip randint to preserve random state
+            self.client_total_rounds = [min_rounds] * args.num_clients
+        else:
+            self.client_total_rounds = [
+                random.randint(min_rounds, max_rounds) for _ in range(args.num_clients)
+            ]
+
+        # clients_per_round[r] = number of clients participating in round r
+        self.clients_per_round = [
+            sum(1 for t in self.client_total_rounds if t > r) for r in range(max_rounds)
+        ]
+        self.total_requests = sum(self.client_total_rounds)
+
+        range_ratio = args.range_ratio
+
         # Use return_text=False to get token ids instead of text
-        self.candidate_inputs = sample_random_requests(
+        first_round_samples = sample_random_requests(
             input_len=args.request_length,
             output_len=args.output_length,
             num_prompts=args.num_clients,
-            range_ratio=1.0,
+            range_ratio=range_ratio,
             tokenizer=self.tokenizer,
             dataset_path=args.dataset_path,
             random_sample=not args.disable_random_sample,
             return_text=False,
         )
+        # Store per-sample output_len for first round
+        first_round_output_lens = [row.output_len for row in first_round_samples]
         # r.prompt is now List[int] when return_text=False
-        self.candidate_inputs = [list(i.prompt) for i in self.candidate_inputs]
+        self.candidate_inputs = [list(i.prompt) for i in first_round_samples]
 
         if args.sub_question_input_length != 0:
             sub_question_input_length = args.sub_question_input_length
         else:
             sub_question_input_length = args.request_length
 
+        num_sub_questions = sum(max(t - 1, 0) for t in self.client_total_rounds)
+
         self.sub_question_inputs = sample_random_requests(
             input_len=sub_question_input_length,
             output_len=args.output_length,
-            num_prompts=args.num_clients * max(args.num_rounds - 1, 1),
-            range_ratio=1.0,
+            num_prompts=max(num_sub_questions, 1),
+            range_ratio=range_ratio,
             tokenizer=self.tokenizer,
             dataset_path=args.dataset_path,
             random_sample=not args.disable_random_sample,
@@ -224,14 +284,20 @@ class WorkloadGenerator:
             (
                 i,
                 gen_payload(
-                    self.candidate_inputs[i], args.output_length, args.lora_path
+                    self.candidate_inputs[i],
+                    first_round_output_lens[i],
+                    args.lora_path,
                 ),
             )
             for i in range(args.num_clients)
         ]
         # history now stores List[int] (token ids) for each client
         self.client_records = {
-            i: {"round": 0, "history": list(self.candidate_inputs[i])}
+            i: {
+                "round": 0,
+                "history": list(self.candidate_inputs[i]),
+                "total_rounds": self.client_total_rounds[i],
+            }
             for i in range(args.num_clients)
         }
         self.ready_queue = ReadyQueue(
@@ -240,7 +306,7 @@ class WorkloadGenerator:
         self.candidate_inputs = self.candidate_inputs[args.num_clients :]
 
         self.response_queue = queue.Queue()
-        self.pbar = tqdm(total=args.num_clients * args.num_rounds)
+        self.pbar = tqdm(total=self.total_requests)
         self.performance_metrics = {
             "ttft": [],
             "latency": [],
@@ -251,7 +317,7 @@ class WorkloadGenerator:
         self.enable_round_barrier = args.enable_round_barrier
         if self.enable_round_barrier:
             # Add round-specific metrics while preserving the original structure
-            for i in range(args.num_rounds):
+            for i in range(self.max_rounds):
                 self.performance_metrics[f"round_{i}"] = {
                     "ttft": [],
                     "latency": [],
@@ -261,7 +327,7 @@ class WorkloadGenerator:
                 }
         self.num_clients = args.num_clients
 
-        self.num_rounds = args.num_rounds
+        self.num_rounds = self.max_rounds
         self.max_parallel = args.max_parallel
         self.output_length = args.output_length
 
@@ -310,6 +376,8 @@ class WorkloadGenerator:
 
     def response_handler(self):
         next_round_reqs = []
+        current_barrier_round = 0
+        barrier_round_completed = 0
         while True:
             try:
                 client_id, response = self.response_queue.get(
@@ -344,26 +412,44 @@ class WorkloadGenerator:
                     ].append(response.generated_len)
                 self.completed_requests += 1
 
-                if self.client_records[client_id]["round"] < self.num_rounds:
+                client_total = self.client_records[client_id]["total_rounds"]
+                if self.client_records[client_id]["round"] < client_total:
                     # Append sub-question token ids to client's history
-                    sub_q_ids = list(self.sub_question_inputs.pop().prompt)
+                    sub_q = self.sub_question_inputs.pop()
+                    sub_q_ids = list(sub_q.prompt)
                     self.client_records[client_id]["history"].extend(sub_q_ids)
                     new_req = (
                         client_id,
                         gen_payload(
                             self.client_records[client_id]["history"],
-                            self.output_length,
-                            args.lora_path,
+                            sub_q.output_len,
+                            self.lora_path,
                         ),
                     )
                     if self.enable_round_barrier:
                         next_round_reqs.append(new_req)
-                        if len(next_round_reqs) == self.num_clients:
-                            for req in next_round_reqs:
-                                self.ready_queue.append(req)
-                            next_round_reqs = []
                     else:
                         self.ready_queue.append(new_req)
+
+                # Barrier logic: release next round when all clients for
+                # current barrier round have completed
+                if (
+                    self.enable_round_barrier
+                    and current_barrier_round < self.max_rounds
+                ):
+                    barrier_round_completed += 1
+                    expected = self.clients_per_round[current_barrier_round]
+                    if barrier_round_completed == expected:
+                        print(
+                            f"\n  Barrier: round {current_barrier_round} complete "
+                            f"({expected} clients), releasing {len(next_round_reqs)} "
+                            f"requests for round {current_barrier_round + 1}"
+                        )
+                        for req in next_round_reqs:
+                            self.ready_queue.append(req)
+                        next_round_reqs = []
+                        current_barrier_round += 1
+                        barrier_round_completed = 0
             except queue.Empty:
                 if self.pbar.n == self.pbar.total:
                     break
@@ -443,7 +529,7 @@ class WorkloadGenerator:
         }
         if self.enable_round_barrier:
             performance_data["round"] = {}
-            for round_num in range(args.num_rounds):
+            for round_num in range(self.num_rounds):
                 round_key = f"round_{round_num}"
                 round_metrics = self.performance_metrics[round_key]
                 performance_data["round"][round_key] = {
@@ -505,10 +591,12 @@ class WorkloadGenerator:
                         avg_ttft = round_data["average_ttft"]
                         cache_hit_rate = round_data["cache_hit_rate"]
                         request_count = round_data["request_count"]
+                        clients_in_round = self.clients_per_round[round_num]
                         print(
                             f"  Round {round_num}: Average TTFT = {avg_ttft:.2f}s, "
                             f"Cache Hit Rate = {cache_hit_rate:.6f} "
-                            f"({request_count} requests)"
+                            f"({request_count} requests, "
+                            f"{clients_in_round} clients)"
                         )
                     else:
                         print(f"  Round {round_num}: No requests completed")
