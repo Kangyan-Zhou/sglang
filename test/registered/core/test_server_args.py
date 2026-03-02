@@ -301,6 +301,14 @@ class TestSSLArgs(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", host="0.0.0.0")
         self.assertEqual(server_args.url(), "http://127.0.0.1:30000")
 
+    def test_url_rewrites_empty_host_to_loopback(self):
+        server_args = ServerArgs(model_path="dummy", host="")
+        self.assertEqual(server_args.url(), "http://127.0.0.1:30000")
+
+    def test_url_rewrites_ipv6_all_interfaces_to_loopback(self):
+        server_args = ServerArgs(model_path="dummy", host="::")
+        self.assertEqual(server_args.url(), "http://[::1]:30000")
+
     @patch("os.path.isfile", return_value=True)
     def test_url_returns_https_with_ssl(self, _mock_isfile):
         server_args = ServerArgs(

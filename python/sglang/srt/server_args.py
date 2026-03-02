@@ -5400,7 +5400,7 @@ class ServerArgs:
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
         host = self.host
-        if host == "0.0.0.0":
+        if not host or host == "0.0.0.0":
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
