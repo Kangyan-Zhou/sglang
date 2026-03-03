@@ -781,6 +781,70 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         self.trace_ctx.abort()
 
+    def compute_and_observe_kv_transfer_metrics(
+        self,
+        num_tokens: int,
+        page_size: int,
+        bytes_per_page_all_layers: int,
+    ) -> Optional[dict]:
+        """Compute KV transfer metrics and observe them via the metrics collector.
+
+        Returns a dict with latency_ms, total_mb, speed_gb_s if computable, else None.
+        """
+        from sglang.srt.disaggregation.utils import kv_to_page_num
+
+        result = {}
+
+        # Transfer latency, size, and speed
+        if self.prefill_transfer_queue_entry_time > 0 and self.completion_time > 0:
+            transfer_latency_s = (
+                self.completion_time - self.prefill_transfer_queue_entry_time
+            )
+            latency_ms = transfer_latency_s * 1000
+
+            num_pages = kv_to_page_num(num_tokens, page_size)
+            total_bytes = bytes_per_page_all_layers * num_pages
+            total_mb = total_bytes / (1024 * 1024)
+            self.transfer_total_mb = total_mb
+
+            speed_gb_s = 0.0
+            if transfer_latency_s > 0:
+                speed_gb_s = (total_mb / 1024) / transfer_latency_s
+                self.transfer_speed_gb_s = speed_gb_s
+
+            result["latency_ms"] = latency_ms
+            result["total_mb"] = total_mb
+            result["speed_gb_s"] = speed_gb_s
+
+            if self.enable_metrics:
+                self.metrics_collector.observe_kv_transfer_metrics(
+                    latency_ms=latency_ms,
+                    total_mb=total_mb,
+                    speed_gb_s=speed_gb_s,
+                )
+
+        # Bootstrap and alloc durations
+        if (
+            self.prefill_bootstrap_queue_entry_time > 0
+            and self.bootstrap_done_time > 0
+            and self.wait_queue_entry_time > 0
+        ):
+            bootstrap_ms = (
+                self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
+            ) * 1000
+            alloc_ms = (self.wait_queue_entry_time - self.bootstrap_done_time) * 1000
+
+            result["bootstrap_ms"] = bootstrap_ms
+            result["alloc_ms"] = alloc_ms
+
+            if self.enable_metrics:
+                self.metrics_collector.observe_kv_transfer_bootstrap(
+                    bootstrap_ms=bootstrap_ms,
+                    alloc_ms=alloc_ms,
+                )
+
+        return result if result else None
+
     def set_quick_finish_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
@@ -831,6 +895,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             stage, ts - self.decode_prealloc_queue_entry_time
         )
         self.trace_slice(stage, self.decode_prealloc_queue_entry_time, ts)
+
+    def set_bootstrap_done_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.bootstrap_done_time == 0.0:
+            self.bootstrap_done_time = ts
 
     def set_decode_prebuilt_finish_time(self, ts=None):
         if ts is None:

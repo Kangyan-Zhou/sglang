@@ -21,7 +21,6 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -481,8 +480,7 @@ class DecodePreallocQueue:
                 pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
-                if decode_req.req.time_stats.bootstrap_done_time == 0.0:
-                    decode_req.req.time_stats.bootstrap_done_time = time.perf_counter()
+                decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
