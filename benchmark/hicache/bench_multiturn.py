@@ -352,6 +352,7 @@ class WorkloadGenerator:
         self.pbar = tqdm(total=self.total_requests)
         self.performance_metrics = {
             "ttft": [],
+            "itl": [],
             "latency": [],
             "prompt_len": [],
             "cached_tokens": [],
@@ -438,6 +439,7 @@ class WorkloadGenerator:
                 current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
+                self.performance_metrics["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
                 self.performance_metrics["cached_tokens"].append(response.cached_tokens)
@@ -533,6 +535,7 @@ class WorkloadGenerator:
         duration = self.finished_time - self.start_time
         sorted_ttft = sorted(self.performance_metrics["ttft"])
         sorted_latency = sorted(self.performance_metrics["latency"])
+        sorted_itl = sorted(self.performance_metrics["itl"])
         sorted_prompt_len = sorted(self.performance_metrics["prompt_len"])
         sorted_output_len = sorted(self.performance_metrics["generated_len"])
 
@@ -573,6 +576,16 @@ class WorkloadGenerator:
                 "p99_ttft": percentile(sorted_ttft, 0.99),
                 "median_ttft": percentile(sorted_ttft, 0.5),
                 "max_ttft": max_or_zero(sorted_ttft),
+                "average_itl": (
+                    sum(self.performance_metrics["itl"])
+                    / len(self.performance_metrics["itl"])
+                    if self.performance_metrics["itl"]
+                    else 0.0
+                ),
+                "p90_itl": percentile(sorted_itl, 0.9),
+                "p99_itl": percentile(sorted_itl, 0.99),
+                "median_itl": percentile(sorted_itl, 0.5),
+                "max_itl": max_or_zero(sorted_itl),
                 "average_latency": sum(self.performance_metrics["latency"])
                 / len(self.performance_metrics["latency"]),
                 "p90_latency": percentile(sorted_latency, 0.9),
@@ -641,6 +654,11 @@ class WorkloadGenerator:
         print(f"  P99 TTFT: {performance_data['summary']['p99_ttft']:.2f}")
         print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
         print(f"  Max TTFT: {performance_data['summary']['max_ttft']:.2f}")
+        print(f"  Average ITL: {performance_data['summary']['average_itl']:.4f}")
+        print(f"  P90 ITL: {performance_data['summary']['p90_itl']:.4f}")
+        print(f"  P99 ITL: {performance_data['summary']['p99_itl']:.4f}")
+        print(f"  Median ITL: {performance_data['summary']['median_itl']:.4f}")
+        print(f"  Max ITL: {performance_data['summary']['max_itl']:.4f}")
         print(
             f"  Average latency: {performance_data['summary']['average_latency']:.2f}"
         )
