@@ -11,10 +11,11 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
+from sglang.bench_serving import RequestFuncOutput
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer
 from sglang.test.kits.cache_hit_kit import (
-    async_request_openai_completions,
+    async_request_openai_chat_completions,
     async_request_sglang_generate,
     gen_payload,
     gen_payload_openai,
@@ -162,7 +163,7 @@ def parse_args():
         default="sglang",
         choices=["sglang", "openai"],
         help="API format to use: 'sglang' for native /generate endpoint, "
-        "'openai' for OpenAI-compatible /v1/completions endpoint.",
+        "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
     return parser.parse_args()
 
@@ -214,8 +215,8 @@ class WorkloadGenerator:
 
         # Construct the base URL and select request/payload functions
         if self.api_format == "openai":
-            self.url = f"http://{args.host}:{args.port}/v1/completions"
-            self.request_func = async_request_openai_completions
+            self.url = f"http://{args.host}:{args.port}/v1/chat/completions"
+            self.request_func = async_request_openai_chat_completions
         else:
             self.url = f"http://{args.host}:{args.port}/generate"
             self.request_func = async_request_sglang_generate
@@ -302,12 +303,21 @@ class WorkloadGenerator:
         )
 
         if self.api_format == "openai":
-            # OpenAI mode: history is text, decode initial token IDs
+            # OpenAI mode: history is a messages list for /v1/chat/completions
+            initial_messages = {
+                i: [
+                    {
+                        "role": "user",
+                        "content": self.tokenizer.decode(self.candidate_inputs[i]),
+                    }
+                ]
+                for i in range(args.num_clients)
+            }
             init_requests = [
                 (
                     i,
                     gen_payload_openai(
-                        self.tokenizer.decode(self.candidate_inputs[i]),
+                        initial_messages[i],
                         first_round_output_lens[i],
                         self.model_path,
                     ),
@@ -317,7 +327,7 @@ class WorkloadGenerator:
             self.client_records = {
                 i: {
                     "round": 0,
-                    "history": self.tokenizer.decode(self.candidate_inputs[i]),
+                    "history": initial_messages[i],
                     "total_rounds": self.client_total_rounds[i],
                 }
                 for i in range(args.num_clients)
@@ -376,14 +386,18 @@ class WorkloadGenerator:
         self.output_length = args.output_length
 
     async def handle_request(self, item):
+        client_id, payload = item
         try:
-            client_id, payload = item
             response = await self.request_func(payload, self.url, self.pbar)
             if self.pbar.n == self.pbar.total:
                 self.finished_time = time.perf_counter()
             self.response_queue.put((client_id, response))
         except Exception as e:
-            print(f"Request failed: {e}")
+            print(f"Request failed for client {client_id}: {e}")
+            failed_response = RequestFuncOutput()
+            failed_response.success = False
+            failed_response.error = str(e)
+            self.response_queue.put((client_id, failed_response))
 
     def request_sender(self):
         async def request_loop():
@@ -428,10 +442,15 @@ class WorkloadGenerator:
                     timeout=10
                 )  # Block until response is available
                 if not response.success:
-                    raise ValueError(f"Request failed with error: {response.error}")
+                    print(f"Request failed for client {client_id}: {response.error}")
+                    self.completed_requests += 1
+                    continue
                 # Extend history with response
                 if self.api_format == "openai":
-                    self.client_records[client_id]["history"] += response.generated_text
+                    if response.generated_text:
+                        self.client_records[client_id]["history"].append(
+                            {"role": "assistant", "content": response.generated_text}
+                        )
                 else:
                     self.client_records[client_id]["history"].extend(
                         response.output_ids
@@ -466,9 +485,11 @@ class WorkloadGenerator:
                 if self.client_records[client_id]["round"] < client_total:
                     sub_q = self.sub_question_inputs.pop()
                     if self.api_format == "openai":
-                        # Append sub-question as decoded text
+                        # Append sub-question as a new user message
                         sub_q_text = self.tokenizer.decode(list(sub_q.prompt))
-                        self.client_records[client_id]["history"] += sub_q_text
+                        self.client_records[client_id]["history"].append(
+                            {"role": "user", "content": sub_q_text}
+                        )
                         new_req = (
                             client_id,
                             gen_payload_openai(

@@ -89,12 +89,12 @@ async def async_request_sglang_generate(
     return output
 
 
-async def async_request_openai_completions(
+async def async_request_openai_chat_completions(
     payload,
     url,
     pbar=None,
 ):
-    """Send a streaming request to an OpenAI-compatible /v1/completions endpoint.
+    """Send a streaming request to an OpenAI-compatible /v1/chat/completions endpoint.
 
     Returns a RequestFuncOutput with the same dynamic attributes as
     async_request_sglang_generate (except output_ids, which is unavailable).
@@ -129,7 +129,8 @@ async def async_request_openai_completions(
 
                             # Streaming token chunks
                             if data.get("choices"):
-                                text = data["choices"][0].get("text", "")
+                                raw_delta = data["choices"][0].get("delta")
+                                text = raw_delta.get("content", "") if raw_delta else ""
                                 if text:
                                     generated_text += text
                                     timestamp = time.perf_counter()
@@ -174,10 +175,10 @@ async def async_request_openai_completions(
     return output
 
 
-def gen_payload_openai(prompt_text, output_len, model):
+def gen_payload_openai(messages, output_len, model):
     return {
         "model": model,
-        "prompt": prompt_text,
+        "messages": messages,
         "max_tokens": output_len,
         "temperature": 0.0,
         "stream": True,
