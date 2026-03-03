@@ -13,7 +13,12 @@ from tqdm.asyncio import tqdm
 
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer
-from sglang.test.kits.cache_hit_kit import async_request_sglang_generate, gen_payload
+from sglang.test.kits.cache_hit_kit import (
+    async_request_openai_completions,
+    async_request_sglang_generate,
+    gen_payload,
+    gen_payload_openai,
+)
 
 
 def parse_args():
@@ -151,6 +156,14 @@ def parse_args():
         default="",
         help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.",
     )
+    parser.add_argument(
+        "--api-format",
+        type=str,
+        default="sglang",
+        choices=["sglang", "openai"],
+        help="API format to use: 'sglang' for native /generate endpoint, "
+        "'openai' for OpenAI-compatible /v1/completions endpoint.",
+    )
     return parser.parse_args()
 
 
@@ -196,8 +209,16 @@ class ReadyQueue:
 
 class WorkloadGenerator:
     def __init__(self, args):
-        # Construct the base URL for requests
-        self.url = f"http://{args.host}:{args.port}/generate"
+        self.api_format = args.api_format
+        self.model_path = args.model_path
+
+        # Construct the base URL and select request/payload functions
+        if self.api_format == "openai":
+            self.url = f"http://{args.host}:{args.port}/v1/completions"
+            self.request_func = async_request_openai_completions
+        else:
+            self.url = f"http://{args.host}:{args.port}/generate"
+            self.request_func = async_request_sglang_generate
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
@@ -280,26 +301,48 @@ class WorkloadGenerator:
             return_text=False,
         )
 
-        init_requests = [
-            (
-                i,
-                gen_payload(
-                    self.candidate_inputs[i],
-                    first_round_output_lens[i],
-                    args.lora_path,
-                ),
-            )
-            for i in range(args.num_clients)
-        ]
-        # history now stores List[int] (token ids) for each client
-        self.client_records = {
-            i: {
-                "round": 0,
-                "history": list(self.candidate_inputs[i]),
-                "total_rounds": self.client_total_rounds[i],
+        if self.api_format == "openai":
+            # OpenAI mode: history is text, decode initial token IDs
+            init_requests = [
+                (
+                    i,
+                    gen_payload_openai(
+                        self.tokenizer.decode(self.candidate_inputs[i]),
+                        first_round_output_lens[i],
+                        self.model_path,
+                    ),
+                )
+                for i in range(args.num_clients)
+            ]
+            self.client_records = {
+                i: {
+                    "round": 0,
+                    "history": self.tokenizer.decode(self.candidate_inputs[i]),
+                    "total_rounds": self.client_total_rounds[i],
+                }
+                for i in range(args.num_clients)
             }
-            for i in range(args.num_clients)
-        }
+        else:
+            # SGLang mode: history is List[int] (token ids)
+            init_requests = [
+                (
+                    i,
+                    gen_payload(
+                        self.candidate_inputs[i],
+                        first_round_output_lens[i],
+                        args.lora_path,
+                    ),
+                )
+                for i in range(args.num_clients)
+            ]
+            self.client_records = {
+                i: {
+                    "round": 0,
+                    "history": list(self.candidate_inputs[i]),
+                    "total_rounds": self.client_total_rounds[i],
+                }
+                for i in range(args.num_clients)
+            }
         self.ready_queue = ReadyQueue(
             init_requests=init_requests, policy=args.ready_queue_policy
         )
@@ -334,7 +377,7 @@ class WorkloadGenerator:
     async def handle_request(self, item):
         try:
             client_id, payload = item
-            response = await async_request_sglang_generate(payload, self.url, self.pbar)
+            response = await self.request_func(payload, self.url, self.pbar)
             if self.pbar.n == self.pbar.total:
                 self.finished_time = time.perf_counter()
             self.response_queue.put((client_id, response))
@@ -385,8 +428,13 @@ class WorkloadGenerator:
                 )  # Block until response is available
                 if not response.success:
                     raise ValueError(f"Request failed with error: {response.error}")
-                # Use output_ids (token ids) instead of generated_text
-                self.client_records[client_id]["history"].extend(response.output_ids)
+                # Extend history with response
+                if self.api_format == "openai":
+                    self.client_records[client_id]["history"] += response.generated_text
+                else:
+                    self.client_records[client_id]["history"].extend(
+                        response.output_ids
+                    )
                 current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
@@ -414,18 +462,31 @@ class WorkloadGenerator:
 
                 client_total = self.client_records[client_id]["total_rounds"]
                 if self.client_records[client_id]["round"] < client_total:
-                    # Append sub-question token ids to client's history
                     sub_q = self.sub_question_inputs.pop()
-                    sub_q_ids = list(sub_q.prompt)
-                    self.client_records[client_id]["history"].extend(sub_q_ids)
-                    new_req = (
-                        client_id,
-                        gen_payload(
-                            self.client_records[client_id]["history"],
-                            sub_q.output_len,
-                            self.lora_path,
-                        ),
-                    )
+                    if self.api_format == "openai":
+                        # Append sub-question as decoded text
+                        sub_q_text = self.tokenizer.decode(list(sub_q.prompt))
+                        self.client_records[client_id]["history"] += sub_q_text
+                        new_req = (
+                            client_id,
+                            gen_payload_openai(
+                                self.client_records[client_id]["history"],
+                                sub_q.output_len,
+                                self.model_path,
+                            ),
+                        )
+                    else:
+                        # Append sub-question token ids to client's history
+                        sub_q_ids = list(sub_q.prompt)
+                        self.client_records[client_id]["history"].extend(sub_q_ids)
+                        new_req = (
+                            client_id,
+                            gen_payload(
+                                self.client_records[client_id]["history"],
+                                sub_q.output_len,
+                                self.lora_path,
+                            ),
+                        )
                     if self.enable_round_barrier:
                         next_round_reqs.append(new_req)
                     else:
