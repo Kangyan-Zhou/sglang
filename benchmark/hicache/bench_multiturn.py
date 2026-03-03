@@ -533,6 +533,8 @@ class WorkloadGenerator:
         duration = self.finished_time - self.start_time
         sorted_ttft = sorted(self.performance_metrics["ttft"])
         sorted_latency = sorted(self.performance_metrics["latency"])
+        sorted_prompt_len = sorted(self.performance_metrics["prompt_len"])
+        sorted_output_len = sorted(self.performance_metrics["generated_len"])
 
         def percentile(sorted_vals, q):
             if not sorted_vals:
@@ -561,6 +563,10 @@ class WorkloadGenerator:
                     if self.performance_metrics["generated_len"]
                     else 0.0
                 ),
+                "p90_prompt_len": percentile(sorted_prompt_len, 0.9),
+                "p99_prompt_len": percentile(sorted_prompt_len, 0.99),
+                "p90_output_len": percentile(sorted_output_len, 0.9),
+                "p99_output_len": percentile(sorted_output_len, 0.99),
                 "average_ttft": sum(self.performance_metrics["ttft"])
                 / len(self.performance_metrics["ttft"]),
                 "p90_ttft": percentile(sorted_ttft, 0.9),
@@ -617,6 +623,18 @@ class WorkloadGenerator:
         )
         print(
             f"  Average Output Length: {performance_data['summary']['average_output_len']:.2f} tokens"
+        )
+        print(
+            f"  P90 Prompt Length: {performance_data['summary']['p90_prompt_len']:.0f} tokens"
+        )
+        print(
+            f"  P99 Prompt Length: {performance_data['summary']['p99_prompt_len']:.0f} tokens"
+        )
+        print(
+            f"  P90 Output Length: {performance_data['summary']['p90_output_len']:.0f} tokens"
+        )
+        print(
+            f"  P99 Output Length: {performance_data['summary']['p99_output_len']:.0f} tokens"
         )
         print(f"  Average TTFT: {performance_data['summary']['average_ttft']:.2f}")
         print(f"  P90 TTFT: {performance_data['summary']['p90_ttft']:.2f}")
