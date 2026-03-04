@@ -498,6 +498,32 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _abort_pending_reqs_for_addr(
+        self, bootstrap_addr: str, error_message: str, status_code: HTTPStatus
+    ) -> None:
+        """Abort pending requests targeting a specific bootstrap address."""
+        failed_reqs = []
+        remaining_reqs = []
+        for req in self.pending_reqs:
+            if f"{req.bootstrap_host}:{req.bootstrap_port}" == bootstrap_addr:
+                failed_reqs.append(req)
+            else:
+                remaining_reqs.append(req)
+        self.pending_reqs = remaining_reqs
+
+        abort_message = (
+            f"{error_message}. Aborting {len(failed_reqs)} pending request(s)."
+        )
+        logger.error(abort_message)
+        for req in failed_reqs:
+            try:
+                prepare_abort(req, abort_message, status_code=status_code)
+                self.scheduler.stream_output([req], req.return_logprob)
+            except Exception as e:
+                logger.error(f"Failed to abort request {req.rid}: {e}")
+            if self.scheduler.enable_metrics:
+                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and create receivers."""
         if not self.pending_reqs:
@@ -509,34 +535,24 @@ class DecodePreallocQueue:
         # we need get the prefill info before resolving the prefill_dp_ranks
         # which is a conflict with the lazy resolve logic in CommonKVReceiver,
         # so we need to ensure the parallel info before resolving it.
-        if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
-            # Abort only the pending requests targeting this unreachable bootstrap
-            # address; keep requests for other addresses so they can be resolved
-            # in subsequent calls.
-            failed_reqs = [
-                req
-                for req in self.pending_reqs
-                if f"{req.bootstrap_host}:{req.bootstrap_port}" == bootstrap_addr
-            ]
-            self.pending_reqs = [
-                req
-                for req in self.pending_reqs
-                if f"{req.bootstrap_host}:{req.bootstrap_port}" != bootstrap_addr
-            ]
-            error_message = (
-                f"Failed to fetch prefill server info from {bootstrap_addr} "
-                f"after retries. Aborting {len(failed_reqs)} pending request(s)."
+        try:
+            info_available = self.kv_manager.ensure_parallel_info(bootstrap_addr)
+        except RuntimeError as e:
+            # Configuration mismatch (page_size or kv_cache_dtype) is permanent
+            # — abort all pending requests for this address.
+            self._abort_pending_reqs_for_addr(
+                bootstrap_addr,
+                f"Configuration mismatch with prefill server at {bootstrap_addr}: {e}",
+                HTTPStatus.BAD_REQUEST,
             )
-            logger.error(error_message)
-            for req in failed_reqs:
-                prepare_abort(
-                    req,
-                    error_message,
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                )
-                self.scheduler.stream_output([req], req.return_logprob)
-                if self.scheduler.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            return
+
+        if not info_available:
+            self._abort_pending_reqs_for_addr(
+                bootstrap_addr,
+                f"Failed to fetch prefill server info from {bootstrap_addr} after retries",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
             return
 
         resolved = []
