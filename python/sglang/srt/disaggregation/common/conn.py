@@ -112,10 +112,10 @@ class CommonKVManager(BaseKVManager):
         self.local_ip = get_local_ip_auto()
 
         # bind zmq socket
-        context = zmq.Context()
+        self._zmq_context = zmq.Context()
         zmq_bind_host = maybe_wrap_ipv6_address(self.local_ip)
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=zmq_bind_host
+            self._zmq_context, zmq.PULL, host=zmq_bind_host
         )
         logger.debug(f"kv manager bind to {zmq_bind_host}:{self.rank_port}")
 
@@ -162,6 +162,20 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def shutdown(self):
+        """Close ZMQ socket and context to unblock threads waiting on recv_multipart().
+
+        Subclasses should call super().shutdown() before performing backend-specific cleanup.
+        """
+        try:
+            self.server_socket.close(linger=0)
+        except Exception as e:
+            logger.warning(f"Failed to close ZMQ server socket: {e}")
+        try:
+            self._zmq_context.term()
+        except Exception as e:
+            logger.warning(f"Failed to terminate ZMQ context: {e}")
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]

@@ -879,7 +879,26 @@ class NixlKVManager(CommonKVManager):
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        threading.Thread(target=bootstrap_thread, daemon=True).start()
+
+    def shutdown(self):
+        """Deregister NIXL RDMA memory and close ZMQ sockets for clean process exit."""
+        logger.info("NixlKVManager shutting down...")
+
+        # 1. Close ZMQ sockets to unblock threads waiting on recv_multipart()
+        super().shutdown()
+
+        # 2. Deregister RDMA memory regions via NIXL agent
+        if hasattr(self, "agent") and self.agent is not None:
+            for desc_name in ("kv_descs", "aux_descs", "state_descs"):
+                descs = getattr(self, desc_name, None)
+                if descs is not None:
+                    try:
+                        self.agent.deregister_memory(descs)
+                    except Exception as e:
+                        logger.warning(f"Failed to deregister {desc_name}: {e}")
+
+        logger.info("NixlKVManager shutdown complete.")
 
 
 class NixlKVSender(CommonKVSender):
