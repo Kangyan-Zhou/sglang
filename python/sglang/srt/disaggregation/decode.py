@@ -510,6 +510,23 @@ class DecodePreallocQueue:
         # which is a conflict with the lazy resolve logic in CommonKVReceiver,
         # so we need to ensure the parallel info before resolving it.
         if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
+            # Abort all pending requests targeting this unreachable bootstrap address
+            # to prevent blocking the scheduler indefinitely on every step.
+            error_message = (
+                f"Failed to fetch prefill server info from {bootstrap_addr} "
+                f"after retries. Aborting {len(self.pending_reqs)} pending request(s)."
+            )
+            logger.error(error_message)
+            for req in self.pending_reqs:
+                prepare_abort(
+                    req,
+                    error_message,
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self.scheduler.stream_output([req], req.return_logprob)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            self.pending_reqs = []
             return
 
         resolved = []
