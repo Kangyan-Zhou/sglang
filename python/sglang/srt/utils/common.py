@@ -1728,15 +1728,30 @@ def get_device_sm():
 def _cuda_mem_fallback(reason: str) -> int:
     """Fallback to torch.cuda.mem_get_info() and return total GPU memory in MiB.
 
+    Queries all visible CUDA devices and returns the minimum total memory,
+    consistent with the nvidia-smi path that takes min(memory_values).
+
     Returns the total memory in MiB, or raises RuntimeError if CUDA is
     unavailable or mem_get_info() fails.
     """
     if not torch.cuda.is_available():
         raise RuntimeError(reason)
-    logger.warning(f"{reason} Falling back to torch.cuda.mem_get_info().")
     try:
-        return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MiB
-    except RuntimeError as e:
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            raise RuntimeError("No CUDA devices found.")
+        memory_values = []
+        for i in range(device_count):
+            total = torch.cuda.mem_get_info(i)[1] // 1024 // 1024  # unit: MiB
+            memory_values.append(total)
+        result = min(memory_values)
+        logger.warning(
+            f"{reason} Falling back to torch.cuda.mem_get_info(). "
+            f"Reported total GPU memory per device (MiB): {memory_values}, "
+            f"using min: {result} MiB."
+        )
+        return result
+    except Exception as e:
         raise RuntimeError(
             f"{reason} torch.cuda.mem_get_info() fallback also failed: {e}"
         ) from e
