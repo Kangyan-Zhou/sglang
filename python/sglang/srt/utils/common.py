@@ -1739,7 +1739,8 @@ def _cuda_mem_fallback(reason: str) -> int:
     try:
         device_count = torch.cuda.device_count()
         if device_count == 0:
-            raise RuntimeError("No CUDA devices found.")
+            # Include the original failure reason for diagnostics
+            raise RuntimeError(f"{reason} No CUDA devices found via torch.cuda.")
         memory_values = []
         for i in range(device_count):
             total = torch.cuda.mem_get_info(i)[1] // 1024 // 1024  # unit: MiB
@@ -1751,7 +1752,7 @@ def _cuda_mem_fallback(reason: str) -> int:
             f"using min: {result} MiB."
         )
         return result
-    except Exception as e:
+    except (RuntimeError, ValueError, OSError) as e:
         raise RuntimeError(
             f"{reason} torch.cuda.mem_get_info() fallback also failed: {e}"
         ) from e
