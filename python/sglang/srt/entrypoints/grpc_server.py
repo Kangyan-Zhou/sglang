@@ -28,6 +28,7 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 import sglang
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.environ import SglangEnv as envs
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
@@ -172,10 +173,51 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
             self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
 
+        # Admission control: reject requests when queued count exceeds limit.
+        # In disaggregation mode, the scheduler's _abort_on_disagg_queued_limit
+        # checks PD-specific queue depths, but it only sees requests after the
+        # gRPC server forwards them.  We enforce an additional limit here at
+        # the gRPC entry point using num_queued_requests (requests waiting to
+        # be dispatched to the scheduler) so the router receives a rejection
+        # immediately and can retry on another worker.
+        disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
+        if (
+            disagg_mode != DisaggregationMode.NULL
+            and envs.SGLANG_DISAGGREGATION_ENABLE_QUEUE_LIMIT.get()
+            and server_args.max_queued_requests is not None
+        ):
+            self._max_queued_requests = server_args.max_queued_requests
+            logger.info(
+                f"gRPC admission control ACTIVE: max_queued_requests="
+                f"{self._max_queued_requests} (disagg mode={disagg_mode.value})"
+            )
+        else:
+            self._max_queued_requests = None
+
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
 
         logger.info("gRPC scheduler servicer initialized")
+
+    def _check_admission(self, request_id: str) -> Optional[str]:
+        """Return a rejection message if the server is over capacity, else None.
+
+        Best-effort gate — under burst concurrency, multiple coroutines may
+        pass before the counter is incremented. This is acceptable; the
+        goal is backpressure signaling, not precise limiting.
+        """
+        if self._max_queued_requests is None:
+            return None
+        num_queued = self.request_manager.num_queued_requests
+        if num_queued < self._max_queued_requests:
+            return None
+        message = (
+            f"Too many queued requests ({num_queued}, "
+            f"limit {self._max_queued_requests}). "
+            f"Please retry later."
+        )
+        logger.warning(f"Rejecting request {request_id}: {message}")
+        return message
 
     async def Generate(
         self,
@@ -184,6 +226,22 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> AsyncIterator[sglang_scheduler_pb2.GenerateResponse]:
         """Handle generation requests with streaming responses."""
         logger.info(f"Receive generation request: {request.request_id}")
+
+        # Admission control: reject immediately if too many queued requests.
+        rejection = self._check_admission(request.request_id)
+        if rejection is not None:
+            # Use 503 (Service Unavailable) to match the unified engine's
+            # _abort_on_queued_limit behaviour.  The Rust gateway treats both
+            # 429 and 503 as retryable (see is_retryable_status in retry.rs),
+            # so the router will still retry on another worker.
+            yield sglang_scheduler_pb2.GenerateResponse(
+                request_id=request.request_id,
+                error=sglang_scheduler_pb2.GenerateError(
+                    message=rejection,
+                    http_status_code="503",
+                ),
+            )
+            return
 
         try:
             # Convert gRPC request to internal format
@@ -249,6 +307,20 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.EmbedResponse:
         """Handle embedding requests."""
         logger.info(f"Receive embedding request: {request.request_id}")
+
+        rejection = self._check_admission(request.request_id)
+        if rejection is not None:
+            # Use 503 (Service Unavailable) to match the unified engine's
+            # _abort_on_queued_limit behaviour.  The Rust gateway treats both
+            # 429 and 503 as retryable (see is_retryable_status in retry.rs),
+            # so the router will still retry on another worker.
+            return sglang_scheduler_pb2.EmbedResponse(
+                request_id=request.request_id,
+                error=sglang_scheduler_pb2.EmbedError(
+                    message=rejection,
+                    code="SERVICE_UNAVAILABLE",
+                ),
+            )
 
         try:
             tokenized_req = self._convert_embed_request(request)

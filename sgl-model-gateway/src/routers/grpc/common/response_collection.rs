@@ -35,14 +35,44 @@ pub(crate) async fn collect_responses(
             mut prefill,
             decode,
         } => {
-            // Collect prefill for input_logprobs (don't mark completed yet)
-            let prefill_responses =
-                utils::collect_stream_responses(&mut prefill, "Prefill").await?;
-
-            // Collect decode for actual output (don't mark completed yet)
+            // Spawn both stream collections as independent tokio tasks so the
+            // tokio scheduler can multiplex them across worker threads. Without
+            // spawning, each request handler task blocks on stream.next().await
+            // and with N concurrent PD requests (2N streams), all worker threads
+            // end up blocked in a circular deadlock (threads wait on data from
+            // streams, but HTTP/2 receive buffers can't be drained because no
+            // free thread is available).
+            //
+            // By spawning, each stream collection becomes a lightweight task
+            // that yields back to the scheduler between polls, allowing the
+            // runtime to interleave I/O processing across many streams with
+            // only a few worker threads.
             let mut decode_stream = *decode;
-            let mut decode_responses =
-                utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+
+            let prefill_handle = tokio::spawn(async move {
+                let result = utils::collect_stream_responses(&mut prefill, "Prefill").await;
+                (result, prefill)
+            });
+
+            let decode_handle = tokio::spawn(async move {
+                let result =
+                    utils::collect_stream_responses(&mut decode_stream, "Decode").await;
+                (result, decode_stream)
+            });
+
+            // Await both spawned tasks. JoinError only occurs if the task
+            // panics, which should not happen in normal operation.
+            let (prefill_join, decode_join) = tokio::join!(prefill_handle, decode_handle);
+
+            let (prefill_result, mut prefill) = prefill_join.map_err(|e| {
+                error::internal_error("prefill_task_failed", format!("Prefill task panicked: {}", e))
+            })?;
+            let (decode_result, mut decode_stream) = decode_join.map_err(|e| {
+                error::internal_error("decode_task_failed", format!("Decode task panicked: {}", e))
+            })?;
+
+            let prefill_responses = prefill_result?;
+            let mut decode_responses = decode_result?;
 
             // Mark both streams as completed now that both succeeded
             prefill.mark_completed();

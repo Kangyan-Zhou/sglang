@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
+use uuid::Uuid;
 
 use super::pd_types::api_path;
 use crate::{
@@ -499,6 +500,9 @@ impl PDRouter {
                         StatusCode::BAD_GATEWAY => {
                             error::bad_gateway("decode_bad_gateway", error_message)
                         }
+                        StatusCode::TOO_MANY_REQUESTS => {
+                            error::too_many_requests("decode_too_many_requests", error_message)
+                        }
                         _ => error::internal_error("decode_error", error_message),
                     }
                 }
@@ -521,6 +525,9 @@ impl PDRouter {
                         }
                         StatusCode::BAD_GATEWAY => {
                             error::bad_gateway("decode_read_failed", error_message)
+                        }
+                        StatusCode::TOO_MANY_REQUESTS => {
+                            error::too_many_requests("decode_too_many_requests_read_failed", error_message)
                         }
                         _ => error::internal_error("decode_read_failed", error_message),
                     }
@@ -546,6 +553,12 @@ impl PDRouter {
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
+        // Inject a router-generated rid so we can abort the decode request
+        // if prefill is rejected. The SGLang engine uses this rid if provided.
+        let mut json_request = json_request;
+        let rid = Uuid::new_v4().to_string().replace("-", "");
+        json_request["rid"] = Value::String(rid.clone());
+
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -568,16 +581,50 @@ impl PDRouter {
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Send both requests concurrently, but await prefill first.
+        // Prefill completes quickly (~1s), while decode blocks until generation
+        // finishes (or 300s KV transfer timeout). By awaiting prefill first, we can
+        // immediately abort decode if prefill fails, instead of waiting 300s.
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        // Spawn decode as a background task so we can await prefill independently
+        let decode_handle = tokio::spawn(decode_request.send());
+        let prefill_result = prefill_request.send().await;
+
+        // Process prefill response first — if it failed, abort decode immediately
+        let prefill_body = match self
+            .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
+            .await
+        {
+            Ok((_, body)) => body,
+            Err(error_response) => {
+                // Prefill failed — abort the decode request so it doesn't
+                // wait 300s for KV transfer that will never arrive.
+                self.abort_decode_request(decode.url(), &rid).await;
+                decode_handle.abort();
+                return error_response;
+            }
+        };
+
+        // Prefill succeeded — now wait for decode to complete
+        let decode_result = match decode_handle.await {
+            Ok(result) => result,
+            Err(e) => {
+                error!(
+                    decode_url = %decode.url(),
+                    error = %e,
+                    "Decode task panicked or was cancelled"
+                );
+                return error::bad_gateway(
+                    "decode_server_error",
+                    format!("Decode server error: {}", e),
+                );
+            }
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -599,30 +646,6 @@ impl PDRouter {
                         .handle_decode_error_response(res, &context, prefill, decode)
                         .await;
                 }
-
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
 
                 if context.is_stream {
                     // Streaming response
@@ -1009,6 +1032,10 @@ impl PDRouter {
                     "prefill_bad_gateway",
                     format!("Prefill server error ({}): {}", prefill_status, error_msg),
                 ),
+                StatusCode::TOO_MANY_REQUESTS => error::too_many_requests(
+                    "prefill_too_many_requests",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
                 _ => error::internal_error(
                     "prefill_error",
                     format!("Prefill server error ({}): {}", prefill_status, error_msg),
@@ -1037,6 +1064,30 @@ impl PDRouter {
         };
 
         Ok((prefill_status, prefill_body))
+    }
+
+    /// Fire-and-forget abort of a decode request by its rid.
+    /// Called when prefill rejects a request so the decode side doesn't wait
+    /// 300s for KV transfer that will never arrive.
+    async fn abort_decode_request(&self, decode_url: &str, rid: &str) {
+        let url = format!("{}/abort_request", decode_url);
+        let body = json!({"rid": rid});
+        match self.client.post(&url).json(&body).send().await {
+            Ok(res) => {
+                debug!(
+                    "Abort decode request rid={} decode_url={} status={}",
+                    rid,
+                    decode_url,
+                    res.status()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to abort decode request rid={} decode_url={}: {}",
+                    rid, decode_url, e
+                );
+            }
+        }
     }
 
     fn build_post_with_headers(

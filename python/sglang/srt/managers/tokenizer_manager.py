@@ -1188,6 +1188,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     ) in (
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         HTTPStatus.INTERNAL_SERVER_ERROR,
+                        HTTPStatus.TOO_MANY_REQUESTS,
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and

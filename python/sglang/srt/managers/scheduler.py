@@ -388,8 +388,24 @@ class Scheduler(
         # Init profiler
         self.init_profiler()
 
-        # Init prefill-decodedisaggregation
+        # Init prefill-decode disaggregation
         self.init_disaggregation()
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            if not envs.SGLANG_DISAGGREGATION_ENABLE_QUEUE_LIMIT.get():
+                logger.warning(
+                    "Disaggregation queue limit is DISABLED via "
+                    "SGLANG_DISAGGREGATION_ENABLE_QUEUE_LIMIT=false"
+                )
+            elif self.max_queued_requests is None:
+                logger.info(
+                    "Disaggregation queue limit is INACTIVE: "
+                    "--max-queued-requests is not set"
+                )
+            else:
+                logger.info(
+                    "Disaggregation queue limit is ACTIVE: "
+                    f"max_queued_requests={self.max_queued_requests}"
+                )
 
         # Init overlap schedule
         self.init_overlap()
@@ -1752,12 +1768,16 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._abort_on_disagg_queued_limit(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if not is_retracted and self._abort_on_disagg_queued_limit(req):
+                return
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -1830,7 +1850,7 @@ class Scheduler(
             AbortReq(
                 finished_reason={
                     "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "status_code": HTTPStatus.TOO_MANY_REQUESTS,
                     "message": message,
                 },
                 rid=req_to_abort.rid,
@@ -1839,6 +1859,47 @@ class Scheduler(
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
+
+    def _abort_on_disagg_queued_limit(self, recv_req: Req) -> bool:
+        """Abort an incoming request if disagg queues exceed max_queued_requests. Returns True if aborted."""
+        if not envs.SGLANG_DISAGGREGATION_ENABLE_QUEUE_LIMIT.get():
+            return False
+        if self.max_queued_requests is None:
+            return False
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            total_queued = len(self.waiting_queue)
+            logger.info(
+                f"Disagg prefill admission check: waiting_queue={total_queued}, "
+                f"limit={self.max_queued_requests}"
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            total_queued = len(self.waiting_queue)
+            logger.info(
+                f"Disagg decode admission check: waiting_queue={total_queued}, "
+                f"limit={self.max_queued_requests}"
+            )
+        else:
+            return False
+
+        if total_queued < self.max_queued_requests:
+            return False
+
+        message = f"The disaggregation request queue is full (depth {total_queued}, limit {self.max_queued_requests})."
+        logger.warning(f"Rejecting request {recv_req.rid}: {message}")
+        self.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                    "message": message,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
+        recv_req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        return True
 
     def _abort_on_waiting_timeout(self):
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:

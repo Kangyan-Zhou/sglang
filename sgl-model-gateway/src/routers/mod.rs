@@ -201,6 +201,6 @@ pub trait RouterTrait: Send + Sync + Debug {
 
     /// Check if this is a PD router
     fn is_pd_mode(&self) -> bool {
-        self.router_type() == "pd"
+        self.router_type().contains("pd")
     }
 }

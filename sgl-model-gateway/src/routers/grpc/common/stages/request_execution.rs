@@ -8,7 +8,9 @@ use super::PipelineStage;
 use crate::routers::{
     error,
     grpc::{
-        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
+        context::{
+            ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection,
+        },
         proto_wrapper::{
             ProtoEmbedRequest, ProtoEmbedResponseVariant, ProtoGenerateRequest, ProtoRequest,
             ProtoStream,
@@ -235,6 +237,10 @@ impl RequestExecutionStage {
         let prefill_request = proto_request.clone_inner();
         let decode_request = proto_request;
 
+        // Establish both gRPC streams concurrently using tokio::join!.
+        // This ensures neither future blocks the other during stream setup.
+        // If either worker fails, the other stream's AbortOnDropStream will
+        // automatically send an abort when dropped (RAII cleanup).
         let (prefill_result, decode_result): (StreamResult, StreamResult) = tokio::join!(
             prefill_client.generate(prefill_request),
             decode_client.generate(decode_request)

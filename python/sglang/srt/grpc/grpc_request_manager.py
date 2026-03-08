@@ -197,6 +197,7 @@ class GrpcRequestManager:
 
         # State Management (from TokenizerManager)
         self.rid_to_state: Dict[str, GrpcReqState] = {}
+        self.num_queued_requests: int = 0
         self.asyncio_tasks: set = set()
         self.gracefully_exit = False
         self.no_create_loop = False
@@ -371,10 +372,14 @@ class GrpcRequestManager:
         self.record_request_for_crash_dump(obj)
 
         try:
-            # Send to scheduler - let exceptions bubble up to grpc_server.py
-            state.time_stats.set_api_server_dispatch_time()
-            await self._send_to_scheduler(obj)
-            state.time_stats.set_api_server_dispatch_finish_time()
+            self.num_queued_requests += 1
+            try:
+                # Send to scheduler - let exceptions bubble up to grpc_server.py
+                state.time_stats.set_api_server_dispatch_time()
+                await self._send_to_scheduler(obj)
+                state.time_stats.set_api_server_dispatch_finish_time()
+            finally:
+                self.num_queued_requests -= 1
 
             is_stream = getattr(obj, "stream", False)
 
@@ -430,6 +435,7 @@ class GrpcRequestManager:
         future = asyncio.Future()
 
         # Send to scheduler
+        self.num_queued_requests += 1
         try:
             state.time_stats.set_api_server_dispatch_time()
             await self._send_to_scheduler(obj)
@@ -438,6 +444,8 @@ class GrpcRequestManager:
             del self.rid_to_state[request_id]
             future.set_exception(e)
             return future
+        finally:
+            self.num_queued_requests -= 1
 
         # Wait for result in background
         async def wait_for_result():

@@ -361,6 +361,13 @@ impl ProtoGenerateError {
             Self::Sglang(e) => &e.message,
         }
     }
+
+    /// Get HTTP status code from the error (e.g. "503" for backpressure)
+    pub fn http_status_code(&self) -> Option<u16> {
+        match self {
+            Self::Sglang(e) => e.http_status_code.parse::<u16>().ok(),
+        }
+    }
 }
 
 /// Unified stream wrapper

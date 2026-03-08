@@ -664,10 +664,18 @@ pub(crate) async fn collect_stream_responses(
                     ProtoResponseVariant::Error(err) => {
                         error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message(), "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
-                        return Err(error::internal_error(
-                            "worker_generation_failed",
-                            format!("{} generation failed: {}", worker_name, err.message()),
-                        ));
+                        // Propagate the original HTTP status code.  The engine
+                        // returns 503 (Service Unavailable) for queue-full
+                        // rejections, consistent with the unified engine's
+                        // _abort_on_queued_limit behaviour.  The gateway treats
+                        // both 429 and 503 as retryable (see
+                        // is_retryable_status in retry.rs).
+                        let error_code = "worker_generation_failed";
+                        let error_msg = format!("{} generation failed: {}", worker_name, err.message());
+                        return Err(match err.http_status_code() {
+                            Some(503) => error::service_unavailable(error_code, error_msg),
+                            _ => error::internal_error(error_code, error_msg),
+                        });
                     }
                     ProtoResponseVariant::Chunk(_chunk) => {
                         // Streaming chunk - no action needed
