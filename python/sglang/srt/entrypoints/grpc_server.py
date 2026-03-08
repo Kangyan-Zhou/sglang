@@ -28,7 +28,6 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 import sglang
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.environ import SglangEnv as envs
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
@@ -173,26 +172,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
             self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
 
-        # Admission control: reject requests when queued count exceeds limit.
-        # In disaggregation mode, the scheduler's _abort_on_disagg_queued_limit
-        # checks PD-specific queue depths, but it only sees requests after the
-        # gRPC server forwards them.  We enforce an additional limit here at
-        # the gRPC entry point using num_queued_requests (requests waiting to
-        # be dispatched to the scheduler) so the router receives a rejection
-        # immediately and can retry on another worker.
-        disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
-        if (
-            disagg_mode != DisaggregationMode.NULL
-            and envs.SGLANG_DISAGGREGATION_ENABLE_QUEUE_LIMIT.get()
-            and server_args.max_queued_requests is not None
-        ):
-            self._max_queued_requests = server_args.max_queued_requests
-            logger.info(
-                f"gRPC admission control ACTIVE: max_queued_requests="
-                f"{self._max_queued_requests} (disagg mode={disagg_mode.value})"
-            )
-        else:
-            self._max_queued_requests = None
+        # Admission control at the gRPC entry point is DISABLED.
+        # The scheduler-side _abort_on_disagg_queued_limit (controlled by
+        # SGLANG_DISAGGREGATION_ENABLE_QUEUE_LIMIT and --max-queued-requests)
+        # correctly checks actual queue depth (len(waiting_queue)), whereas
+        # the gRPC-level num_queued_requests counter spans the entire request
+        # lifecycle (including token streaming), making it an in-flight counter
+        # rather than a queue-depth counter — which causes false rejections
+        # under normal load.
+        self._max_queued_requests = None
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()

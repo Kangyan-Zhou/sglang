@@ -281,10 +281,6 @@ pub(crate) fn init_metrics() {
         "smg_worker_retry_backoff_seconds",
         "Retry backoff duration by attempt number"
     );
-    describe_counter!(
-        "smg_prefill_cancelled_total",
-        "Prefill requests cancelled early due to decode failure in PD dual dispatch"
-    );
 
     // Layer 4: Discovery metrics
     describe_counter!(
@@ -1039,11 +1035,6 @@ impl Metrics {
             "attempt" => attempt_str
         )
         .record(duration.as_secs_f64());
-    }
-
-    /// Record a prefill request cancelled early due to decode failure.
-    pub fn record_prefill_cancelled() {
-        counter!("smg_prefill_cancelled_total").increment(1);
     }
 
     // ========================================================================
