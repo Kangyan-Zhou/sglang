@@ -466,8 +466,9 @@ WORKDIR /sgl-workspace/sglang
 # - JIT compilation support for FP8/microscaling kernels
 # - Ready-to-run inference server environment
 #
-# Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
+# Note: Uses base image + selective JIT packages to minimize size (~27GB vs ~48GB with cudnn-devel)
+# cuBLAS, cuDNN, NCCL shared libraries come from pip packages (nvidia-cublas-cu12, etc.)
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
@@ -478,10 +479,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
+# pip nvidia packages provide cuBLAS, cuDNN, NCCL .so files — add them to LD_LIBRARY_PATH
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
-    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/lib/python3.12/dist-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib" \
+    LIBRARY_PATH="/usr/local/cuda/lib64/stubs"
 
-# Install runtime dependencies (devel base provides gcc/g++/build tools)
+# Install runtime dependencies and JIT compilation toolchain
+# Using base image instead of devel — selectively install only what JIT needs
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     apt-get update && apt-get install -y --no-install-recommends \
     # Python runtime
@@ -521,10 +525,18 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     rdma-core \
     infiniband-diags \
     perftest \
-    # Build tools for JIT compilation
+    # Build tools for JIT compilation (gcc/g++ needed by DeepGEMM, Triton, FlashInfer)
+    build-essential \
     ninja-build \
-    # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
-    libnccl2 \
+    # CUDA JIT toolchain (nvcc, headers, NVRTC — cuBLAS/cuDNN/NCCL .so come from pip)
+    cuda-nvcc-12-9 \
+    cuda-nvrtc-12-9 \
+    cuda-nvrtc-dev-12-9 \
+    cuda-nvvm-12-9 \
+    cuda-cudart-dev-12-9 \
+    cuda-cccl-12-9 \
+    cuda-cuobjdump-12-9 \
+    # NCCL dev headers needed for pynccl_allocator JIT compilation (-lnccl)
     libnccl-dev \
     # GPG key verification
     gnupg2 \
