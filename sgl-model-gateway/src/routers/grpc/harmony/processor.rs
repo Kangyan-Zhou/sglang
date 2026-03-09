@@ -14,8 +14,9 @@ use crate::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{CompletionTokensDetails, ToolCall, Usage},
         responses::{
-            OutputTokensDetails, ResponseContentPart, ResponseOutputItem, ResponseReasoningContent,
-            ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+            InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseOutputItem,
+            ResponseReasoningContent, ResponseStatus, ResponseUsage, ResponsesRequest,
+            ResponsesResponse, ResponsesUsage,
         },
     },
     routers::{
@@ -328,7 +329,11 @@ impl HarmonyResponseProcessor {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
                 total_tokens: usage.total_tokens,
-                input_tokens_details: None,
+                input_tokens_details: usage.prompt_tokens_details.as_ref().map(|d| {
+                    InputTokensDetails {
+                        cached_tokens: d.cached_tokens,
+                    }
+                }),
                 output_tokens_details: usage.completion_tokens_details.as_ref().and_then(|d| {
                     d.reasoning_tokens.map(|tokens| OutputTokensDetails {
                         reasoning_tokens: tokens,

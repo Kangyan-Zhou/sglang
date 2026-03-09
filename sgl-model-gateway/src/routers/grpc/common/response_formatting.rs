@@ -4,7 +4,10 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
-use crate::{protocols::common::Usage, routers::grpc::proto_wrapper::ProtoGenerateComplete};
+use crate::{
+    protocols::common::{PromptTokenUsageInfo, Usage},
+    routers::grpc::proto_wrapper::ProtoGenerateComplete,
+};
 
 /// Build usage information from collected gRPC responses
 ///
@@ -19,11 +22,19 @@ use crate::{protocols::common::Usage, routers::grpc::proto_wrapper::ProtoGenerat
 pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
     let total_prompt_tokens: u32 = responses.iter().map(|r| r.prompt_tokens() as u32).sum();
     let total_completion_tokens: u32 = responses.iter().map(|r| r.completion_tokens() as u32).sum();
+    let total_cached_tokens: u32 = responses.iter().map(|r| r.cached_tokens() as u32).sum();
 
     Usage {
         prompt_tokens: total_prompt_tokens,
         completion_tokens: total_completion_tokens,
         total_tokens: total_prompt_tokens + total_completion_tokens,
         completion_tokens_details: None,
+        prompt_tokens_details: if total_cached_tokens > 0 {
+            Some(PromptTokenUsageInfo {
+                cached_tokens: total_cached_tokens,
+            })
+        } else {
+            None
+        },
     }
 }

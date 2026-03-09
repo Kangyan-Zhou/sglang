@@ -1,5 +1,5 @@
 [workspace]
-members = ["bindings/python", "llm-tokenizer-patched"]
+members = ["bindings/python", "llm-tokenizer-patched", "openai-protocol-patched"]
 
 [package]
 name = "sgl-model-gateway"
@@ -202,3 +202,4 @@ opt-level = 1
 
 [patch.crates-io]
 llm-tokenizer = { path = "llm-tokenizer-patched" }
+openai-protocol = { path = "openai-protocol-patched" }

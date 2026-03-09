@@ -27,9 +27,13 @@ use crate::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
         },
-        common::{CompletionTokensDetails, FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
+        common::{
+            CompletionTokensDetails, FunctionCallDelta, PromptTokenUsageInfo, ToolCall,
+            ToolCallDelta, Usage,
+        },
         responses::{
-            OutputTokensDetails, ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage,
+            InputTokensDetails, OutputTokensDetails, ResponseStatus, ResponseUsage,
+            ResponsesResponse, ResponsesUsage,
         },
     },
     routers::grpc::{
@@ -214,6 +218,7 @@ impl HarmonyStreamingProcessor {
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completion_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -287,6 +292,7 @@ impl HarmonyStreamingProcessor {
                         }),
                     );
                     prompt_tokens.insert(index, complete.prompt_tokens as u32);
+                    cached_tokens.insert(index, complete.cached_tokens as u32);
                     *completion_tokens.entry(index).or_insert(0) =
                         complete.completion_tokens as u32;
 
@@ -317,12 +323,14 @@ impl HarmonyStreamingProcessor {
         // Compute totals once for both usage chunk and metrics
         let total_prompt: u32 = prompt_tokens.values().sum();
         let total_completion: u32 = completion_tokens.values().sum();
+        let total_cached: u32 = cached_tokens.values().sum();
 
         // Emit final usage if requested
         if let Some(true) = stream_options.as_ref().and_then(|so| so.include_usage) {
             Self::emit_usage_chunk(
                 total_prompt,
                 total_completion,
+                total_cached,
                 &dispatch,
                 &original_request,
                 tx,
@@ -361,6 +369,7 @@ impl HarmonyStreamingProcessor {
 
         // Phase 1: Process prefill stream (collect metadata)
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
         while let Some(result) = prefill_stream.next().await {
             let response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
@@ -368,6 +377,7 @@ impl HarmonyStreamingProcessor {
             if let ProtoResponseVariant::Complete(complete_wrapper) = response.into_response() {
                 let complete = complete_wrapper.as_sglang();
                 prompt_tokens.insert(complete.index, complete.prompt_tokens as u32);
+                cached_tokens.insert(complete.index, complete.cached_tokens as u32);
             }
         }
 
@@ -479,12 +489,14 @@ impl HarmonyStreamingProcessor {
         // Compute totals once for both usage chunk and metrics
         let total_prompt: u32 = prompt_tokens.values().sum();
         let total_completion: u32 = completion_tokens.values().sum();
+        let total_cached: u32 = cached_tokens.values().sum();
 
         // Emit final usage if requested
         if let Some(true) = stream_options.as_ref().and_then(|so| so.include_usage) {
             Self::emit_usage_chunk(
                 total_prompt,
                 total_completion,
+                total_cached,
                 &dispatch,
                 &original_request,
                 tx,
@@ -606,6 +618,7 @@ impl HarmonyStreamingProcessor {
     fn emit_usage_chunk(
         prompt_tokens: u32,
         completion_tokens: u32,
+        cached_tokens: u32,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -618,6 +631,11 @@ impl HarmonyStreamingProcessor {
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
                     completion_tokens_details: None,
+                    prompt_tokens_details: if cached_tokens > 0 {
+                        Some(PromptTokenUsageInfo { cached_tokens })
+                    } else {
+                        None
+                    },
                 })
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
@@ -738,6 +756,7 @@ impl HarmonyStreamingProcessor {
         let mut matched_stop: Option<serde_json::Value> = None;
         let mut prompt_tokens: u32 = 0;
         let mut completion_tokens: u32 = 0;
+        let mut cached_tokens_count: u32 = 0;
         let mut reasoning_token_count: u32 = 0;
 
         // Process stream
@@ -933,6 +952,7 @@ impl HarmonyStreamingProcessor {
                     });
                     prompt_tokens = complete.prompt_tokens as u32;
                     completion_tokens = complete.completion_tokens as u32;
+                    cached_tokens_count = complete.cached_tokens as u32;
 
                     // Finalize parser and get complete output
                     let final_output = parser
@@ -1149,6 +1169,13 @@ impl HarmonyStreamingProcessor {
                         } else {
                             None
                         },
+                        prompt_tokens_details: if cached_tokens_count > 0 {
+                            Some(PromptTokenUsageInfo {
+                                cached_tokens: cached_tokens_count,
+                            })
+                        } else {
+                            None
+                        },
                     },
                     request_id: emitter.response_id.clone(),
                 });
@@ -1166,7 +1193,13 @@ impl HarmonyStreamingProcessor {
                         input_tokens: prompt_tokens,
                         output_tokens: completion_tokens,
                         total_tokens: prompt_tokens + completion_tokens,
-                        input_tokens_details: None,
+                        input_tokens_details: if cached_tokens_count > 0 {
+                            Some(InputTokensDetails {
+                                cached_tokens: cached_tokens_count,
+                            })
+                        } else {
+                            None
+                        },
                         output_tokens_details: if reasoning_token_count > 0 {
                             Some(OutputTokensDetails {
                                 reasoning_tokens: reasoning_token_count,
@@ -1184,6 +1217,13 @@ impl HarmonyStreamingProcessor {
                 completion_tokens_details: if reasoning_token_count > 0 {
                     Some(CompletionTokensDetails {
                         reasoning_tokens: Some(reasoning_token_count),
+                    })
+                } else {
+                    None
+                },
+                prompt_tokens_details: if cached_tokens_count > 0 {
+                    Some(PromptTokenUsageInfo {
+                        cached_tokens: cached_tokens_count,
                     })
                 } else {
                     None

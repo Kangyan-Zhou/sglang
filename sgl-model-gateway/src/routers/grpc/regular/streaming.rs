@@ -20,8 +20,8 @@ use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
         common::{
-            FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue,
-            Usage,
+            FunctionCallDelta, PromptTokenUsageInfo, StringOrArray, Tool, ToolCallDelta,
+            ToolChoice, ToolChoiceValue, Usage,
         },
         generate::GenerateRequest,
     },
@@ -565,7 +565,7 @@ impl StreamingProcessor {
             if stream_opts.include_usage.unwrap_or(false) {
                 let total_prompt: u32 = prompt_tokens.values().sum();
                 let total_completion: u32 = completion_tokens.values().sum();
-
+                let total_cached: u32 = cached_tokens.values().sum();
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
                     .usage(Usage {
@@ -573,6 +573,13 @@ impl StreamingProcessor {
                         completion_tokens: total_completion,
                         total_tokens: total_prompt + total_completion,
                         completion_tokens_details: None,
+                        prompt_tokens_details: if total_cached > 0 {
+                            Some(PromptTokenUsageInfo {
+                                cached_tokens: total_cached,
+                            })
+                        } else {
+                            None
+                        },
                     })
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();

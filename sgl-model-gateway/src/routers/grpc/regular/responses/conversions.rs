@@ -347,7 +347,7 @@ pub(crate) fn chat_to_responses(
                 .completion_tokens_details
                 .as_ref()
                 .and_then(|d| d.reasoning_tokens),
-            prompt_tokens_details: None, // Chat response doesn't have this
+            prompt_tokens_details: u.prompt_tokens_details.clone(),
         };
         ResponsesUsage::Classic(usage_info)
     });

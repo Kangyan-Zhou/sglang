@@ -616,7 +616,7 @@ impl ResponseStreamEventEmitter {
                     .completion_tokens_details
                     .as_ref()
                     .and_then(|d| d.reasoning_tokens),
-                prompt_tokens_details: None,
+                prompt_tokens_details: u.prompt_tokens_details.clone(),
             };
             ResponsesUsage::Classic(usage_info)
         });
