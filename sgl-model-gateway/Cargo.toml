@@ -1,5 +1,5 @@
 [workspace]
-members = ["bindings/python"]
+members = ["bindings/python", "llm-tokenizer-patched"]
 
 [package]
 name = "sgl-model-gateway"
