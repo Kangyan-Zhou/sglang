@@ -42,9 +42,13 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import set_prometheus_multiproc_dir
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+# Port offset for the metrics HTTP server relative to the gRPC port
+_METRICS_PORT_OFFSET = 1
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 
@@ -932,11 +936,54 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         await self.request_manager.shutdown()
 
 
+async def _start_metrics_server(host: str, port: int):
+    """Start a lightweight HTTP server to expose Prometheus /metrics endpoint.
+
+    This is the standard pattern for gRPC services: serve gRPC on one port,
+    serve Prometheus metrics on a separate HTTP port.
+    """
+    from aiohttp import web
+    from prometheus_client import (
+        CONTENT_TYPE_LATEST,
+        CollectorRegistry,
+        generate_latest,
+        multiprocess,
+    )
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+
+    async def metrics_handler(request):
+        try:
+            data = generate_latest(registry)
+            return web.Response(body=data, content_type=CONTENT_TYPE_LATEST)
+        except Exception:
+            logger.exception("Failed to generate Prometheus metrics")
+            return web.Response(status=500, text="Failed to generate metrics")
+
+    app = web.Application()
+    app.router.add_get("/metrics", metrics_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    return runner
+
+
 async def serve_grpc(
     server_args: ServerArgs,
     model_info: Optional[Dict] = None,
 ):
     """Start the standalone gRPC server with integrated scheduler."""
+
+    # Set up Prometheus multiprocess dir before launching scheduler subprocesses,
+    # so the env var is inherited and metrics are collected across all processes.
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+        from sglang.srt.observability.func_timer import enable_func_timer
+
+        enable_func_timer()
 
     # Start bootstrap server BEFORE launching scheduler processes (only in PREFILL mode)
     # This ensures the bootstrap server is ready when prefill schedulers try to register
@@ -1170,6 +1217,22 @@ async def serve_grpc(
 
     await server.start()
 
+    # Start Prometheus metrics HTTP server on a side port
+    metrics_runner = None
+    if server_args.enable_metrics:
+        metrics_port = server_args.port + _METRICS_PORT_OFFSET
+        try:
+            metrics_runner = await _start_metrics_server(server_args.host, metrics_port)
+            logger.info(
+                f"Prometheus metrics HTTP server listening on "
+                f"http://{server_args.host}:{metrics_port}/metrics"
+            )
+        except OSError as e:
+            logger.error(
+                f"Failed to start Prometheus metrics server on port {metrics_port}: "
+                f"{e}. gRPC server will continue without metrics."
+            )
+
     # Start warmup in a separate thread
     warmup_thread = threading.Thread(
         target=_wait_and_warmup_grpc,
@@ -1192,6 +1255,13 @@ async def serve_grpc(
         await stop_event.wait()
     finally:
         logger.info("Shutting down gRPC server")
+
+        # Stop the metrics HTTP server
+        if metrics_runner:
+            try:
+                await metrics_runner.cleanup()
+            except Exception:
+                logger.exception("Error cleaning up metrics server")
 
         # Shutdown request manager first - this closes ZMQ sockets and stops background tasks
         await servicer.shutdown()
