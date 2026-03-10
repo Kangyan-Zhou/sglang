@@ -528,14 +528,18 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # Build tools for JIT compilation (gcc/g++ needed by DeepGEMM, Triton, FlashInfer)
     build-essential \
     ninja-build \
+    && CUDA_PKG_SUFFIX=$(echo "${CUDA_VERSION}" | sed -E 's/^([0-9]+)\.([0-9]+).*/\1-\2/') \
+    && CUDA_MAJOR="${CUDA_VERSION%%.*}" \
+    && if [ "$CUDA_MAJOR" -ge 13 ]; then NVVM_PKG="libnvvm-${CUDA_PKG_SUFFIX}"; else NVVM_PKG="cuda-nvvm-${CUDA_PKG_SUFFIX}"; fi \
+    && apt-get install -y --no-install-recommends \
     # CUDA JIT toolchain (nvcc, headers, NVRTC — cuBLAS/cuDNN/NCCL .so come from pip)
-    cuda-nvcc-12-9 \
-    cuda-nvrtc-12-9 \
-    cuda-nvrtc-dev-12-9 \
-    cuda-nvvm-12-9 \
-    cuda-cudart-dev-12-9 \
-    cuda-cccl-12-9 \
-    cuda-cuobjdump-12-9 \
+    cuda-nvcc-${CUDA_PKG_SUFFIX} \
+    cuda-nvrtc-${CUDA_PKG_SUFFIX} \
+    cuda-nvrtc-dev-${CUDA_PKG_SUFFIX} \
+    ${NVVM_PKG} \
+    cuda-cudart-dev-${CUDA_PKG_SUFFIX} \
+    cuda-cccl-${CUDA_PKG_SUFFIX} \
+    cuda-cuobjdump-${CUDA_PKG_SUFFIX} \
     # NCCL dev headers needed for pynccl_allocator JIT compilation (-lnccl)
     libnccl-dev \
     # GPG key verification
