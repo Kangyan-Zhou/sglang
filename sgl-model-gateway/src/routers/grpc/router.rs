@@ -8,10 +8,13 @@ use axum::{
 use tracing::debug;
 
 use super::{
-    common::responses::{
-        handlers::{cancel_response_impl, get_response_impl},
-        utils::validate_worker_availability,
-        ResponsesContext,
+    common::{
+        completion_adapter,
+        responses::{
+            handlers::{cancel_response_impl, get_response_impl},
+            utils::validate_worker_availability,
+            ResponsesContext,
+        },
     },
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
@@ -26,6 +29,7 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
+        completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
@@ -200,6 +204,31 @@ impl GrpcRouter {
             },
         )
         .await
+    }
+
+    /// Route `/v1/completions` by converting to chat and transforming the response
+    async fn route_completion_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!(
+            "Processing completion request for model: {} (via chat adapter)",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
+
+        let is_stream = body.stream;
+        let chat_request = completion_adapter::completion_to_chat(body);
+        let response = self
+            .route_chat_impl(headers, &chat_request, model_id)
+            .await;
+
+        if is_stream {
+            completion_adapter::transform_streaming_response(response).await
+        } else {
+            completion_adapter::transform_non_streaming_response(response).await
+        }
     }
 
     /// Main route_generate implementation
@@ -390,6 +419,15 @@ impl RouterTrait for GrpcRouter {
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
+    }
+
+    async fn route_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_completion_impl(headers, body, model_id).await
     }
 
     async fn route_responses(

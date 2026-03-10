@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
 use tracing::debug;
 
-use super::{context::SharedComponents, pipeline::RequestPipeline};
+use super::{
+    common::completion_adapter, context::SharedComponents, pipeline::RequestPipeline,
+};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
@@ -13,7 +15,9 @@ use crate::{
         UNKNOWN_MODEL_ID,
     },
     observability::metrics::{metrics_labels, Metrics},
-    protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
+    protocols::{
+        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    },
     routers::RouterTrait,
 };
 
@@ -130,6 +134,31 @@ impl GrpcPDRouter {
         .await
     }
 
+    /// Route `/v1/completions` by converting to chat and transforming the response
+    async fn route_completion_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!(
+            "Processing completion request for model: {} (PD mode, via chat adapter)",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
+
+        let is_stream = body.stream;
+        let chat_request = completion_adapter::completion_to_chat(body);
+        let response = self
+            .route_chat_impl(headers, &chat_request, model_id)
+            .await;
+
+        if is_stream {
+            completion_adapter::transform_streaming_response(response).await
+        } else {
+            completion_adapter::transform_non_streaming_response(response).await
+        }
+    }
+
     /// Main route_chat implementation with PD dual dispatch
     async fn route_chat_impl(
         &self,
@@ -236,6 +265,15 @@ impl RouterTrait for GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
+    }
+
+    async fn route_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_completion_impl(headers, body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {
