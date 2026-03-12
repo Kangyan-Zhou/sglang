@@ -2142,7 +2142,11 @@ def _setup_and_run_http_server(
                 ssl_ca_certs=server_args.ssl_ca_certs,
                 ssl_keyfile_password=server_args.ssl_keyfile_password,
             )
-            config.load()  # Validate config eagerly; fail fast before spawning workers
+            # Note: do NOT call config.load() here. The multi-worker path
+            # uses spawn to create child processes, which pickles the config.
+            # config.load() resolves the app import string into the actual app
+            # object (with unpicklable closures), breaking pickling. Each child
+            # calls config.load() independently in Server._serve().
             server = uvicorn.Server(config)
             Multiprocess(config, target=server.run, sockets=[reserved_socket]).run()
     finally:
