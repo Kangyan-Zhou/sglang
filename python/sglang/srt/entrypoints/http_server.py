@@ -2053,9 +2053,13 @@ def _setup_and_run_http_server(
         if server_args.tokenizer_worker_num == 1:
             if server_args.enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
+                # Pass the pre-bound socket via sockets= instead of fd= to
+                # preserve the correct address family (AF_INET/AF_INET6).
+                # uvicorn's fd= path hardcodes AF_UNIX in socket.fromfd(),
+                # which causes the event loop to skip TCP_NODELAY on accepted
+                # connections (both asyncio and uvloop check sock.family).
                 config = uvicorn.Config(
                     app,
-                    fd=reserved_socket.fileno(),
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2080,7 +2084,7 @@ def _setup_and_run_http_server(
                     )
                     logger.info("SSL certificate auto-refresh enabled.")
                     try:
-                        await server.serve()
+                        await server.serve(sockets=[reserved_socket])
                     finally:
                         refresher.stop()
 
@@ -2088,10 +2092,11 @@ def _setup_and_run_http_server(
 
                 asyncio.run(_run_with_ssl_refresh())
             else:
-                # Default case, one tokenizer process
-                uvicorn.run(
+                # Default case, one tokenizer process.
+                # Use Config/Server API with sockets= instead of uvicorn.run(fd=)
+                # to preserve the correct socket family. See comment above.
+                config = uvicorn.Config(
                     app,
-                    fd=reserved_socket.fileno(),
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2101,9 +2106,15 @@ def _setup_and_run_http_server(
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
                 )
+                server = uvicorn.Server(config)
+                server.run(sockets=[reserved_socket])
         else:
-            # Multiple tokenizer and http processes
+            # Multiple tokenizer and http processes.
+            # Build Config/Server manually and use Multiprocess directly with
+            # sockets= to bypass uvicorn's config.bind_socket() which wraps
+            # the fd as AF_UNIX (breaking TCP_NODELAY). See comment above.
             from uvicorn.config import LOGGING_CONFIG
+            from uvicorn.supervisors import Multiprocess
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
                 "handlers": ["default"],
@@ -2119,9 +2130,8 @@ def _setup_and_run_http_server(
                     "SSL refresh will be disabled."
                 )
 
-            uvicorn.run(
+            config = uvicorn.Config(
                 "sglang.srt.entrypoints.http_server:app",
-                fd=reserved_socket.fileno(),
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2132,6 +2142,9 @@ def _setup_and_run_http_server(
                 ssl_ca_certs=server_args.ssl_ca_certs,
                 ssl_keyfile_password=server_args.ssl_keyfile_password,
             )
+            config.load()  # Validate config eagerly; fail fast before spawning workers
+            server = uvicorn.Server(config)
+            Multiprocess(config, target=server.run, sockets=[reserved_socket]).run()
     finally:
         # Close the reserved socket after uvicorn exits or on any error
         # This ensures the port is released even if initialization fails
