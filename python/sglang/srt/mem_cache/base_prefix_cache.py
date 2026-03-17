@@ -258,6 +258,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
 
+    def release_aborted_request(self, rid: str):
+        """Clean up any state associated with an aborted request.
+
+        Subclasses with prefetch or other async state (e.g., HiRadixCache)
+        should override this to terminate in-flight operations.
+        """
+        pass
+
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
