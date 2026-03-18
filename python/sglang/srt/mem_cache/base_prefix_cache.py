@@ -263,6 +263,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
         Subclasses with prefetch or other async state (e.g., HiRadixCache)
         should override this to terminate in-flight operations.
+
+        TEMPORARY FIX: This no-op exists to prevent an AttributeError crash
+        in disagg decode mode, where the cache is ChunkCache but
+        enable_hicache_storage is True (because --hicache-storage-backend is
+        set for decode offload). The real fix should route abort cleanup
+        through DecodeKVCacheOffloadManager rather than tree_cache, since
+        ChunkCache has no awareness of mooncake storage state and a no-op
+        here may silently leak host memory in mooncake store.
+        See: https://github.com/sgl-project/sglang/pull/20790
         """
         pass
 
