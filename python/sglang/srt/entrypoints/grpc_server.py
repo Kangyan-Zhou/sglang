@@ -20,10 +20,12 @@ async def _start_metrics_server(host: str, port: int):
     from aiohttp import web
     from prometheus_client import (
         CollectorRegistry,
-        generate_latest,
         multiprocess,
     )
-    from prometheus_client.exposition import CONTENT_TYPE_LATEST
+    from prometheus_client.openmetrics.exposition import (
+        CONTENT_TYPE_LATEST,
+        generate_latest,
+    )
 
     async def metrics_handler(request):
         try:
@@ -31,6 +33,11 @@ async def _start_metrics_server(host: str, port: int):
             # MultiProcessCollector re-reads the .db files from
             # PROMETHEUS_MULTIPROC_DIR.  This is necessary when not using
             # make_wsgi_app/make_asgi_app, which handle this internally.
+            #
+            # Use OpenMetrics format (same as make_asgi_app) so that metric
+            # names with colons (e.g. sglang:prompt_tokens_total) are
+            # converted to underscores, matching the HTTP-mode output that
+            # Grafana dashboards expect.
             registry = CollectorRegistry()
             multiprocess.MultiProcessCollector(registry)
             data = generate_latest(registry)
