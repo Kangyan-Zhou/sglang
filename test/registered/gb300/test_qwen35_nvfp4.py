@@ -63,7 +63,7 @@ class TestQwen35Nvfp4(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Qwen3.5-397B-NVFP4",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.95),
+            accuracy_params=AccuracyTestParams(dataset="mmmu", baseline_accuracy=0.97),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",
             ),
