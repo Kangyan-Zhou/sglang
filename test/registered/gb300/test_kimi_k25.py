@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
@@ -43,6 +44,7 @@ class TestKimiK25(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Kimi-K2.5",
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",
             ),
