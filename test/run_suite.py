@@ -84,9 +84,8 @@ NIGHTLY_SUITES = {
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
-        # GB300 (4x B200 NVL4) nightly suites
-        "nightly-4-gpu-gb300-nvfp4",
-        "nightly-4-gpu-gb300-fp8",
+        # GB300 (4x B200 NVL4) nightly suite
+        "nightly-4-gpu-gb300",
     ],
     HWBackend.AMD: [
         "nightly-amd",
