@@ -592,6 +592,68 @@ class Engine(EngineBase):
                     f"terminated with {proc.exitcode}"
                 )
 
+        # Event that wait_for_ready sets once all schedulers have
+        # initialised.  The watchdog blocks on this so that it does not
+        # interfere with the clean error path in _wait_for_scheduler_ready
+        # (which gives better diagnostics for startup failures).
+        _watchdog_ready = threading.Event()
+
+        _original_wait_for_ready = wait_for_ready  # noqa: F841 (used in closure)
+
+        def wait_for_ready_and_arm_watchdog():
+            _original_wait_for_ready()
+            _watchdog_ready.set()
+
+        # Replace wait_for_ready so callers automatically arm the watchdog.
+        wait_for_ready = wait_for_ready_and_arm_watchdog
+
+        def _scheduler_watchdog():
+            """Monitor scheduler processes; kill the process tree if any die.
+
+            When NCCL's C++ watchdog detects a fatal error it calls
+            std::abort(), which terminates the child process immediately
+            without executing any Python cleanup — so the ``except``
+            handler that would normally send SIGQUIT to the parent
+            (scheduler.py) never runs.  Without this watchdog the parent
+            stays alive (held open by uvicorn/gRPC on node_rank 0, or the
+            dummy health-check server on node_rank >= 1), K8s probes keep
+            passing, and the pod is never restarted even though it can no
+            longer serve inference.
+            """
+            try:
+                _watchdog_ready.wait()
+                while True:
+                    time.sleep(5)
+                    if any(not proc.is_alive() for proc in scheduler_procs):
+                        # Brief grace period: if the child sent SIGQUIT
+                        # before dying (Python exception path), give the
+                        # existing signal handler time to tear down first.
+                        time.sleep(2)
+                        dead = [
+                            (proc.pid, proc.exitcode)
+                            for proc in scheduler_procs
+                            if not proc.is_alive()
+                        ]
+                        if not dead:
+                            continue  # Recovered (shouldn't happen, but be safe)
+                        logger.error(
+                            "Scheduler watchdog detected dead processes: "
+                            f"{dead}. Shutting down the process tree."
+                        )
+                        kill_process_tree(os.getpid())
+            except Exception:
+                logger.error(
+                    "Scheduler watchdog thread crashed. "
+                    "Shutting down to avoid a silent hang.",
+                    exc_info=True,
+                )
+                kill_process_tree(os.getpid())
+
+        watchdog = threading.Thread(
+            target=_scheduler_watchdog, daemon=True, name="scheduler-watchdog"
+        )
+        watchdog.start()
+
         return SchedulerInitResult(
             scheduler_infos=scheduler_infos,
             wait_for_ready=wait_for_ready,
