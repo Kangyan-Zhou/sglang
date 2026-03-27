@@ -23,7 +23,6 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
 jobs:
   sgl-kernel-unit-test:
@@ -33,10 +32,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
 
       - name: Cleanup
         run: |
@@ -69,10 +64,6 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
       - name: Cleanup
         run: |
           ls -alh sgl-kernel/dist || true
@@ -103,10 +94,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
 
       - name: Cleanup
         run: |
@@ -150,10 +137,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
 
       - name: Cleanup
         run: |
