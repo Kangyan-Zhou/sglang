@@ -77,7 +77,7 @@ jobs:
           echo "${DIGEST}" > /tmp/digest-cu130-amd64-framework.txt
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: digest-cu130-amd64
           path: /tmp/digest-cu130-amd64-framework.txt
@@ -139,7 +139,7 @@ jobs:
           echo "${DIGEST}" > /tmp/digest-cu130-arm64-framework.txt
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: digest-cu130-arm64
           path: /tmp/digest-cu130-arm64-framework.txt
@@ -160,13 +160,13 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Download amd64 digest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: digest-cu130-amd64
           path: /tmp/digests/amd64
 
       - name: Download arm64 digest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: digest-cu130-arm64
           path: /tmp/digests/arm64
