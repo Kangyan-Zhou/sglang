@@ -640,14 +640,17 @@ class Engine(EngineBase):
                             "Scheduler watchdog detected dead processes: "
                             f"{dead}. Shutting down the process tree."
                         )
-                        kill_process_tree(os.getpid())
+                        # os._exit() terminates immediately. We cannot use
+                        # kill_process_tree / SIGKILL because PID 1 in a
+                        # container is immune to SIGKILL.
+                        os._exit(1)
             except Exception:
                 logger.error(
                     "Scheduler watchdog thread crashed. "
                     "Shutting down to avoid a silent hang.",
                     exc_info=True,
                 )
-                kill_process_tree(os.getpid())
+                os._exit(1)
 
         watchdog = threading.Thread(
             target=_scheduler_watchdog, daemon=True, name="scheduler-watchdog"
