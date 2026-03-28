@@ -66,7 +66,9 @@ class TestDeepseekV32(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="DeepSeek-V3.2",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
+            accuracy_params=AccuracyTestParams(
+                dataset="gsm8k", baseline_accuracy=0.935
+            ),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",
             ),
