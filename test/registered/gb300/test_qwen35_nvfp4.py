@@ -23,7 +23,7 @@ COMMON_ARGS = [
 ]
 
 MTP_ARGS = [
-    "--speculative-algo=NEXTN",
+    "--speculative-algorithm=NEXTN",
     "--speculative-num-steps=3",
     "--speculative-eagle-topk=1",
     "--speculative-num-draft-tokens=4",
