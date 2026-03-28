@@ -150,6 +150,212 @@ def _run_simple_eval(
             kill_process_tree(process.pid)
 
 
+def _run_nemo_skills_eval(
+    model: ModelLaunchSettings,
+    base_url: str,
+    dataset: str,
+    max_tokens: Optional[int] = None,
+    repeat: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+) -> Tuple[bool, Optional[str], Optional[dict]]:
+    """Run evaluation using NeMo Skills (ns eval) for benchmarks like mmmu-pro.
+
+    Installs nemo_skills in a uv venv, runs ns eval as a subprocess against
+    the already-running server, and parses the output for accuracy.
+
+    Returns:
+        Tuple of (success, error_message, metrics_dict)
+    """
+    import subprocess
+    import tempfile
+
+    process = None
+    try:
+        process = popen_launch_server(
+            model.model_path,
+            base_url,
+            other_args=model.extra_args,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=model.env,
+        )
+
+        port = int(base_url.split(":")[-1])
+        server_address = f"http://127.0.0.1:{port}/v1"
+        repeat_val = repeat or 1
+        max_tokens_val = max_tokens or 32768
+        benchmark_spec = f"{dataset}:{repeat_val}"
+
+        # Create a uv venv and install nemo_skills
+        venv_dir = tempfile.mkdtemp(prefix="nemo_skills_")
+        print(f"Installing nemo_skills in {venv_dir}...")
+
+        install_result = subprocess.run(
+            [
+                "uv",
+                "venv",
+                f"{venv_dir}/venv",
+                "--python",
+                "3.12",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if install_result.returncode != 0:
+            # Fall back to creating venv without specifying python version
+            subprocess.run(
+                ["uv", "venv", f"{venv_dir}/venv"],
+                capture_output=True,
+                text=True,
+            )
+
+        pip_result = subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                f"{venv_dir}/venv/bin/python",
+                "git+https://github.com/NVIDIA/NeMo-Skills.git",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if pip_result.returncode != 0:
+            return (
+                False,
+                f"Failed to install nemo_skills: {pip_result.stderr[-500:]}",
+                None,
+            )
+
+        # Prepare data
+        ns_bin = f"{venv_dir}/venv/bin/ns"
+        print(f"Preparing {dataset} data...")
+        subprocess.run(
+            [ns_bin, "prepare_data", dataset.replace("-", "_")],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={
+                **dict(__import__("os").environ),
+                "NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK": "1",
+                "VIRTUAL_ENV": f"{venv_dir}/venv",
+                "PATH": f"{venv_dir}/venv/bin:"
+                + __import__("os").environ.get("PATH", ""),
+            },
+        )
+
+        # Build ns eval command
+        output_dir = tempfile.mkdtemp(prefix="ns_eval_output_")
+        cmd = [
+            ns_bin,
+            "eval",
+            f"--benchmarks={benchmark_spec}",
+            "--server_type=sglang",
+            f"--model={model.model_path}",
+            f"--server_address={server_address}",
+            f"--output_dir={output_dir}",
+            f"++inference.tokens_to_generate={max_tokens_val}",
+        ]
+
+        if temperature is not None:
+            cmd.append(f"++inference.temperature={temperature}")
+        if top_p is not None:
+            cmd.append(f"++inference.top_p={top_p}")
+
+        # Add VLM-specific config
+        if dataset in ("mmmu-pro", "mmmu_pro"):
+            cmd.append("++prompt_config=vlm/mmmu-pro")
+            cmd.append("++max_concurrent_requests=64")
+
+        env = {
+            **dict(__import__("os").environ),
+            "NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK": "1",
+            "OPENAI_API_KEY": "dummy",
+            "VIRTUAL_ENV": f"{venv_dir}/venv",
+            "PATH": f"{venv_dir}/venv/bin:" + __import__("os").environ.get("PATH", ""),
+        }
+
+        print(f"Running: {' '.join(cmd)}")
+        eval_result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=7200,
+            env=env,
+        )
+
+        print(eval_result.stdout[-2000:] if eval_result.stdout else "(no stdout)")
+        if eval_result.stderr:
+            print(eval_result.stderr[-1000:])
+
+        if eval_result.returncode != 0:
+            return (
+                False,
+                f"ns eval failed (exit {eval_result.returncode}): {eval_result.stderr[-500:]}",
+                None,
+            )
+
+        # Parse results — ns eval prints accuracy in output
+        # Look for accuracy in the summarize output
+        summarize_result = subprocess.run(
+            [ns_bin, "summarize_results", f"{output_dir}/eval-results"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+
+        output = summarize_result.stdout + "\n" + eval_result.stdout
+        print(f"Summary: {summarize_result.stdout[:1000]}")
+
+        # Parse accuracy from output (format varies, look for common patterns)
+        import re
+
+        score = None
+        for line in output.split("\n"):
+            # Look for "accuracy: 0.XXX" or "Overall accuracy: 0.XXX"
+            match = re.search(r"(?:accuracy|score)[:\s]+([0-9.]+)", line, re.IGNORECASE)
+            if match:
+                score = float(match.group(1))
+
+        if score is None:
+            # Try to find it in eval-results directory
+            import glob
+            import json
+
+            for result_file in glob.glob(
+                f"{output_dir}/eval-results/**/*.json", recursive=True
+            ):
+                try:
+                    with open(result_file) as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        score = (
+                            data.get("accuracy")
+                            or data.get("score")
+                            or data.get("mean_score")
+                        )
+                        if score is not None:
+                            break
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        if score is None:
+            return False, f"Could not parse accuracy from ns eval output", None
+
+        return True, None, {"score": score}
+
+    except subprocess.TimeoutExpired:
+        return False, "NeMo Skills eval timed out", None
+    except Exception as e:
+        return False, f"NeMo Skills eval exception: {str(e)}", None
+    finally:
+        if process:
+            kill_process_tree(process.pid)
+
+
 def _run_few_shot_eval(
     model: ModelLaunchSettings,
     base_url: str,
@@ -224,13 +430,24 @@ def run_accuracy_test(
     print(f"{'='*60}\n")
 
     # Run evaluation based on dataset type
-    # Use few_shot_eval for gsm8k by default for backward compatibility.
-    # Use simple_eval when any extended params are set that few_shot_eval doesn't support.
+    # - NeMo Skills: mmmu-pro (and other VLM evals needing ns eval)
+    # - few_shot_eval: gsm8k (default, backward compatible)
+    # - simple_eval: everything else (gpqa, mmmu, etc.)
     has_extended_params = any(
         getattr(params, field) is not None
         for field in ("thinking_mode", "temperature", "top_p", "top_k", "repeat")
     )
-    if params.dataset == "gsm8k" and not has_extended_params:
+    if params.dataset in ("mmmu-pro", "mmmu_pro"):
+        success, error, metrics = _run_nemo_skills_eval(
+            model=model,
+            base_url=base_url,
+            dataset="mmmu-pro",
+            max_tokens=params.max_tokens,
+            repeat=params.repeat or 1,
+            temperature=params.temperature,
+            top_p=params.top_p,
+        )
+    elif params.dataset == "gsm8k" and not has_extended_params:
         success, error, metrics = _run_few_shot_eval(
             model=model,
             base_url=base_url,

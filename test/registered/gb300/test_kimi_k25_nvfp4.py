@@ -48,7 +48,9 @@ class TestKimiK25Nvfp4(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Kimi-K2.5-NVFP4",
-            accuracy_params=AccuracyTestParams(dataset="mmmu", baseline_accuracy=0.69),
+            accuracy_params=AccuracyTestParams(
+                dataset="mmmu-pro", baseline_accuracy=0.69, repeat=1, max_tokens=32768
+            ),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",
             ),

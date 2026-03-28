@@ -62,7 +62,9 @@ class TestQwen35Fp8(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Qwen3.5-397B-FP8",
-            accuracy_params=AccuracyTestParams(dataset="mmmu", baseline_accuracy=0.97),
+            accuracy_params=AccuracyTestParams(
+                dataset="mmmu-pro", baseline_accuracy=0.78, repeat=1, max_tokens=32768
+            ),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",
             ),
