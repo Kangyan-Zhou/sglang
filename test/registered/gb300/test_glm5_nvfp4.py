@@ -17,7 +17,7 @@ COMMON_ARGS = [
     "--quantization=modelopt_fp4",
     "--moe-runner-backend=flashinfer_trtllm",
     "--kv-cache-dtype=bfloat16",
-    "--mem-fraction-static=0.85",
+    "--mem-fraction-static=0.9",
     "--enable-metrics",
 ]
 

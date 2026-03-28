@@ -18,12 +18,14 @@ COMMON_ARGS = [
     "--fp4-gemm-backend=flashinfer_cutlass",
     "--moe-runner-backend=flashinfer_trtllm",
     "--kv-cache-dtype=fp8_e4m3",
+    "--enable-flashinfer-allreduce-fusion",
+    "--attention-backend=trtllm_mha",
     "--mem-fraction-static=0.8",
     "--enable-metrics",
 ]
 
 MTP_ARGS = [
-    "--speculative-algorithm=NEXTN",
+    "--speculative-algorithm=EAGLE",
     "--speculative-num-steps=3",
     "--speculative-eagle-topk=1",
     "--speculative-num-draft-tokens=4",

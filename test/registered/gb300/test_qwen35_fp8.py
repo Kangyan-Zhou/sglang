@@ -14,12 +14,14 @@ COMMON_ARGS = [
     "--trust-remote-code",
     "--reasoning-parser=qwen3",
     "--tool-call-parser=qwen3_coder",
+    "--enable-flashinfer-allreduce-fusion",
+    "--attention-backend=trtllm_mha",
     "--mem-fraction-static=0.8",
     "--enable-metrics",
 ]
 
 MTP_ARGS = [
-    "--speculative-algorithm=NEXTN",
+    "--speculative-algorithm=EAGLE",
     "--speculative-num-steps=3",
     "--speculative-eagle-topk=1",
     "--speculative-num-draft-tokens=4",
