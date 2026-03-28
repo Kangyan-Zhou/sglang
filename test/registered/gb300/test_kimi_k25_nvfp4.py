@@ -18,6 +18,7 @@ COMMON_ARGS = [
     "--attention-backend=trtllm_mla",
     "--moe-runner-backend=flashinfer_trtllm",
     "--mem-fraction-static=0.8",
+    "--enable-multimodal",
     "--enable-metrics",
 ]
 

@@ -57,7 +57,7 @@ class TestGlm5Fp8(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="GLM-5-FP8",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.95),
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",
             ),

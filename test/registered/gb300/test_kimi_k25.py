@@ -15,6 +15,7 @@ COMMON_ARGS = [
     "--reasoning-parser=kimi_k2",
     "--tool-call-parser=kimi_k2",
     "--mem-fraction-static=0.8",
+    "--enable-multimodal",
     "--enable-metrics",
 ]
 

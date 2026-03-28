@@ -17,6 +17,7 @@ COMMON_ARGS = [
     "--enable-flashinfer-allreduce-fusion",
     "--attention-backend=trtllm_mha",
     "--mem-fraction-static=0.8",
+    "--enable-multimodal",
     "--enable-metrics",
 ]
 
