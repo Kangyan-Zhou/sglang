@@ -309,7 +309,7 @@ def _run_nemo_skills_eval(
         # Add VLM-specific config
         if dataset in ("mmmu-pro", "mmmu_pro"):
             cmd.append("++prompt_config=vlm/mmmu-pro")
-            cmd.append("++max_concurrent_requests=64")
+            cmd.append("++max_concurrent_requests=512")
 
         print(f"Running: {' '.join(cmd)}")
         eval_result = subprocess.run(
