@@ -380,6 +380,44 @@ def _run_nemo_skills_eval(
                     continue
 
         if score is None:
+            # Last resort: compute accuracy directly from JSONL output
+            import glob
+            import json
+
+            for jsonl_file in sorted(
+                glob.glob(f"{output_dir}/eval-results/**/*.jsonl*", recursive=True)
+            ):
+                correct = 0
+                total = 0
+                try:
+                    with open(jsonl_file) as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            entry = json.loads(line)
+                            expected = entry.get("expected_answer", "")
+                            generation = entry.get("generation", "")
+                            # Extract "Answer: X" from the end of generation
+                            answer_match = re.search(
+                                r"Answer:\s*([A-J])", generation, re.IGNORECASE
+                            )
+                            if answer_match:
+                                predicted = answer_match.group(1).upper()
+                                if predicted == expected.upper():
+                                    correct += 1
+                            total += 1
+                except (json.JSONDecodeError, KeyError, OSError):
+                    continue
+                if total > 0:
+                    score = correct / total
+                    print(
+                        f"Computed accuracy from {jsonl_file}: "
+                        f"{correct}/{total} = {score:.4f}"
+                    )
+                    break
+
+        if score is None:
             return False, "Could not parse accuracy from ns eval output", None
 
         return True, None, {"score": score}
