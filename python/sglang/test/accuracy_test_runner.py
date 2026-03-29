@@ -286,11 +286,13 @@ def _run_nemo_skills_eval(
         benchmark_spec = f"{dataset}:{repeat_val}"
 
         # Build ns eval command using venv python
+        # Note: nemo_skills.pipeline.eval requires the "eval" subcommand
         output_dir = tempfile.mkdtemp(prefix="ns_eval_output_")
         cmd = [
             venv_python,
             "-m",
             "nemo_skills.pipeline.eval",
+            "eval",
             f"--benchmarks={benchmark_spec}",
             "--server_type=sglang",
             f"--model={model.model_path}",
