@@ -150,6 +150,74 @@ def _run_simple_eval(
             kill_process_tree(process.pid)
 
 
+def _ensure_nemo_skills_installed() -> bool:
+    """Install nemo_skills into the system python if not already present.
+
+    Returns True if nemo_skills is available after this call.
+    """
+    import subprocess
+
+    try:
+        subprocess.run(
+            ["python3", "-c", "import nemo_skills"],
+            capture_output=True,
+            check=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        pass
+
+    print("Installing nemo_skills into system python...")
+    result = subprocess.run(
+        [
+            "pip",
+            "install",
+            "git+https://github.com/NVIDIA/NeMo-Skills.git",
+            "--ignore-installed",
+            "blinker",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        print(f"pip install nemo_skills failed: {result.stderr[-500:]}")
+        return False
+    return True
+
+
+# Cache: set of datasets already prepared in this process
+_NEMO_DATA_PREPARED: set = set()
+
+
+def _ensure_nemo_data_prepared(dataset: str) -> Tuple[bool, Optional[str]]:
+    """Prepare NeMo Skills dataset data if not already done.
+
+    Returns (success, error_message).
+    """
+    import subprocess
+
+    if dataset in _NEMO_DATA_PREPARED:
+        return True, None
+
+    print(f"Preparing {dataset} data...")
+    env = {
+        **dict(__import__("os").environ),
+        "NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK": "1",
+    }
+    result = subprocess.run(
+        ["python3", "-m", "nemo_skills.dataset.prepare", dataset],
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    if result.returncode != 0:
+        return False, f"Failed to prepare {dataset} data (exit {result.returncode})"
+
+    _NEMO_DATA_PREPARED.add(dataset)
+    return True, None
+
+
 def _run_nemo_skills_eval(
     model: ModelLaunchSettings,
     base_url: str,
@@ -161,8 +229,8 @@ def _run_nemo_skills_eval(
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using NeMo Skills (ns eval) for benchmarks like mmmu-pro.
 
-    Installs nemo_skills in a uv venv, runs ns eval as a subprocess against
-    the already-running server, and parses the output for accuracy.
+    Installs nemo_skills into the system python (once), prepares data (once),
+    and runs ns eval as a subprocess against the already-running server.
 
     Returns:
         Tuple of (success, error_message, metrics_dict)
@@ -172,6 +240,15 @@ def _run_nemo_skills_eval(
 
     process = None
     try:
+        # Install nemo_skills once (idempotent)
+        if not _ensure_nemo_skills_installed():
+            return False, "Failed to install nemo_skills", None
+
+        # Prepare dataset once (cached across variants)
+        ok, err = _ensure_nemo_data_prepared(dataset)
+        if not ok:
+            return False, err, None
+
         process = popen_launch_server(
             model.model_path,
             base_url,
@@ -186,71 +263,12 @@ def _run_nemo_skills_eval(
         max_tokens_val = max_tokens or 32768
         benchmark_spec = f"{dataset}:{repeat_val}"
 
-        # Create a uv venv and install nemo_skills
-        venv_dir = tempfile.mkdtemp(prefix="nemo_skills_")
-        print(f"Installing nemo_skills in {venv_dir}...")
-
-        install_result = subprocess.run(
-            [
-                "uv",
-                "venv",
-                f"{venv_dir}/venv",
-                "--python",
-                "3.12",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if install_result.returncode != 0:
-            # Fall back to creating venv without specifying python version
-            subprocess.run(
-                ["uv", "venv", f"{venv_dir}/venv"],
-                capture_output=True,
-                text=True,
-            )
-
-        pip_result = subprocess.run(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--python",
-                f"{venv_dir}/venv/bin/python",
-                "git+https://github.com/NVIDIA/NeMo-Skills.git",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if pip_result.returncode != 0:
-            return (
-                False,
-                f"Failed to install nemo_skills: {pip_result.stderr[-500:]}",
-                None,
-            )
-
-        # Prepare data
-        ns_bin = f"{venv_dir}/venv/bin/ns"
-        print(f"Preparing {dataset} data...")
-        subprocess.run(
-            [ns_bin, "prepare_data", dataset.replace("-", "_")],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env={
-                **dict(__import__("os").environ),
-                "NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK": "1",
-                "VIRTUAL_ENV": f"{venv_dir}/venv",
-                "PATH": f"{venv_dir}/venv/bin:"
-                + __import__("os").environ.get("PATH", ""),
-            },
-        )
-
         # Build ns eval command
         output_dir = tempfile.mkdtemp(prefix="ns_eval_output_")
         cmd = [
-            ns_bin,
-            "eval",
+            "python3",
+            "-m",
+            "nemo_skills.pipeline.eval",
             f"--benchmarks={benchmark_spec}",
             "--server_type=sglang",
             f"--model={model.model_path}",
@@ -273,8 +291,6 @@ def _run_nemo_skills_eval(
             **dict(__import__("os").environ),
             "NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK": "1",
             "OPENAI_API_KEY": "dummy",
-            "VIRTUAL_ENV": f"{venv_dir}/venv",
-            "PATH": f"{venv_dir}/venv/bin:" + __import__("os").environ.get("PATH", ""),
         }
 
         print(f"Running: {' '.join(cmd)}")
@@ -300,7 +316,12 @@ def _run_nemo_skills_eval(
         # Parse results — ns eval prints accuracy in output
         # Look for accuracy in the summarize output
         summarize_result = subprocess.run(
-            [ns_bin, "summarize_results", f"{output_dir}/eval-results"],
+            [
+                "python3",
+                "-m",
+                "nemo_skills.pipeline.summarize_results",
+                f"{output_dir}/eval-results",
+            ],
             capture_output=True,
             text=True,
             timeout=60,
@@ -343,7 +364,7 @@ def _run_nemo_skills_eval(
                     continue
 
         if score is None:
-            return False, f"Could not parse accuracy from ns eval output", None
+            return False, "Could not parse accuracy from ns eval output", None
 
         return True, None, {"score": score}
 
