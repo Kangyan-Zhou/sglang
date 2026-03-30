@@ -317,6 +317,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         """Initialize metadata for CUDA graph capture."""
         metadata = TRTLLMMHAMetadata()
+        metadata.batch_size = bs
         device = seq_lens.device
 
         if forward_mode.is_decode_or_idle():
