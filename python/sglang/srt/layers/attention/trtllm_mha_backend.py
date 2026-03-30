@@ -56,6 +56,8 @@ class TRTLLMMHAMetadata:
     cu_seqlens_q: torch.Tensor = None
     # Cumulative sequence lengths for key
     cu_seqlens_k: torch.Tensor = None
+    # Batch size at metadata init time (before DP padding may inflate it)
+    batch_size: int = 0
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
@@ -583,10 +585,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Initialize the metadata for a forward pass."""
 
         metadata = TRTLLMMHAMetadata()
-        seqlens_in_batch = forward_batch.seq_lens
-        batch_size = forward_batch.batch_size
-        device = seqlens_in_batch.device
+        metadata.batch_size = forward_batch.batch_size
 
+        seqlens_in_batch = forward_batch.seq_lens
+        device = seqlens_in_batch.device
+        batch_size = forward_batch.batch_size
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
                 # Draft Decode
@@ -871,7 +874,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 max_kv_len=self.max_context_len,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
-                batch_size=forward_batch.batch_size,
+                batch_size=self.forward_metadata.batch_size,
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 window_left=layer.sliding_window_size,
