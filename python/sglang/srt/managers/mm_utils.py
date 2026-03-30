@@ -7,8 +7,9 @@ import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -1632,6 +1633,12 @@ class ShmPointerMMData:
     """
     Wraps a tensor to be sent via a shared memory handle.
     This acts as a "pointer" to the tensor data across process boundaries.
+
+    Lifecycle: tokenizer creates the segment, scheduler ranks open it by name
+    during deserialization, and materialize() clones + unlinks.  We suppress
+    Python's resource_tracker everywhere to prevent it from unlinking the
+    segment behind our back (same workaround used in shm_broadcast.py).
+    See https://stackoverflow.com/q/62748654/9191338.
     """
 
     def __init__(self, tensor: torch.Tensor):
@@ -1643,6 +1650,7 @@ class ShmPointerMMData:
         self.dtype = tensor.dtype
         nbytes = tensor.numel() * tensor.element_size()
         shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        resource_tracker.unregister(shm._name, "shared_memory")
         try:
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
@@ -1666,8 +1674,11 @@ class ShmPointerMMData:
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.shm = None
-        self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
-        # Zero-copy view into shared memory (no clone, no unlink)
+        with patch(
+            "multiprocessing.resource_tracker.register",
+            lambda *args, **kwargs: None,
+        ):
+            self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
             self.shape
         )
@@ -1685,7 +1696,6 @@ class ShmPointerMMData:
         return tensor
 
     def __del__(self):
-        # Only close; never unlink. Unlinking is materialize()'s job.
         if getattr(self, "_shm_handle", None) is not None:
             self._shm_handle.close()
             self._shm_handle = None
