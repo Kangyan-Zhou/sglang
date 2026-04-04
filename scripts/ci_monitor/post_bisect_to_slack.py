@@ -53,6 +53,7 @@ def post_bisect_to_slack(report_file: str) -> bool:
         summary = report.get("summary", {})
         total_analyzed = report.get("total_failures_analyzed", 0)
         total_tokens = report.get("total_tokens_used", 0)
+        error_msg = report.get("error")
 
         client = WebClient(token=token)
         run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -63,7 +64,15 @@ def post_bisect_to_slack(report_file: str) -> bool:
             )
 
         # Build summary message
-        if total_analyzed == 0:
+        if error_msg:
+            mentions = "<@U09R55D8EAY> <@U09ABMCKQPM>"
+            summary_text = (
+                f"{mentions} 🚨 *CI Auto Bisect Failed*\n" f"Error: `{error_msg[:200]}`"
+            )
+            if workflow_url:
+                summary_text += f"\n<{workflow_url}|View logs>"
+            color = "danger"
+        elif total_analyzed == 0:
             summary_text = "✅ *CI Auto Bisect*: No failures requiring analysis"
             if workflow_url:
                 summary_text += f"\n<{workflow_url}|View run>"

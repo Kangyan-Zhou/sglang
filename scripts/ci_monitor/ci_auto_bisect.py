@@ -737,15 +737,30 @@ def gather_bisection_context(
 # ---------------------------------------------------------------------------
 
 
+class SkillLoadError(Exception):
+    """Raised when the bisect skill SKILL.md cannot be loaded or parsed."""
+
+
+# Required sections to extract from SKILL.md. If any are missing after a
+# rename or restructuring, the script raises SkillLoadError so the team
+# gets a Slack notification instead of silently falling back.
+_REQUIRED_SKILL_SECTIONS = {
+    "Key Patterns to Recognize": r"## Key Patterns to Recognize\n(.*?)(?=\n## |\Z)",
+    "Important Notes": r"## Important Notes\n(.*?)(?=\n## |\Z)",
+    "Root Cause Classification": r"### Root Cause Classification\n(.*?)(?=\n### |\Z)",
+}
+
+
 def load_bisect_skill() -> str:
     """Load the bisect skill SKILL.md and extract analysis methodology sections.
 
     Reads the skill definition from the repo and extracts the sections that
     are useful as Claude prompt context: Key Patterns, Important Notes, and
-    Report structure. This keeps the automated workflow in sync with any
-    updates to the skill definition.
+    Root Cause Classification. This keeps the automated workflow in sync with
+    any updates to the skill definition.
 
-    Returns the extracted sections as a string, or a fallback if not found.
+    Raises:
+        SkillLoadError: If SKILL.md is not found or required sections are missing.
     """
     # Try repo-relative path first, then look in common locations
     candidates = [
@@ -763,34 +778,27 @@ def load_bisect_skill() -> str:
             continue
 
     if not content:
-        print(f"  Warning: Could not find {BISECT_SKILL_PATH}, using built-in prompt")
-        return ""
+        raise SkillLoadError(
+            f"Could not find {BISECT_SKILL_PATH}. Searched: {candidates}"
+        )
 
-    # Extract the useful analysis sections (skip bash commands and interactive workflow)
+    # Extract the required analysis sections
     sections = []
+    missing = []
 
-    # Extract "Key Patterns to Recognize" table
-    match = re.search(
-        r"## Key Patterns to Recognize\n(.*?)(?=\n## |\Z)", content, re.DOTALL
-    )
-    if match:
-        sections.append("## Key Patterns to Recognize\n" + match.group(1).strip())
+    for section_name, pattern in _REQUIRED_SKILL_SECTIONS.items():
+        match = re.search(pattern, content, re.DOTALL)
+        if match:
+            sections.append(f"## {section_name}\n{match.group(1).strip()}")
+        else:
+            missing.append(section_name)
 
-    # Extract "Important Notes"
-    match = re.search(r"## Important Notes\n(.*?)(?=\n## |\Z)", content, re.DOTALL)
-    if match:
-        sections.append("## Important Notes\n" + match.group(1).strip())
-
-    # Extract Root Cause Classification from Phase 6 report template
-    match = re.search(
-        r"### Root Cause Classification\n(.*?)(?=\n### |\Z)", content, re.DOTALL
-    )
-    if match:
-        sections.append("## Root Cause Classifications\n" + match.group(1).strip())
-
-    if not sections:
-        print("  Warning: Could not extract sections from SKILL.md")
-        return ""
+    if missing:
+        raise SkillLoadError(
+            f"SKILL.md is missing required sections: {missing}. "
+            f"Was SKILL.md restructured? Update _REQUIRED_SKILL_SECTIONS in "
+            f"ci_auto_bisect.py to match the new section names."
+        )
 
     return "\n\n".join(sections)
 
@@ -805,7 +813,7 @@ def build_prompt(context: BisectionContext, skill_content: str = "") -> str:
 
     Args:
         skill_content: Extracted sections from SKILL.md to use as analysis
-            methodology. Falls back to built-in classification guide if empty.
+            methodology.
     """
     t = context.target
 
@@ -833,11 +841,7 @@ def build_prompt(context: BisectionContext, skill_content: str = "") -> str:
 
     error_str = context.error_signature or "No error logs available"
 
-    # Use skill content if available, otherwise fall back to built-in guide
-    if skill_content:
-        methodology = f"""## Analysis Methodology
-The following analysis methodology is loaded from the project's bisect skill definition.
-Use it to guide your classification.
+    methodology = f"""## Analysis Methodology (from bisect skill definition)
 
 {skill_content}
 
@@ -847,20 +851,6 @@ Classify as exactly ONE of: code_regression, flaky_test, hardware_issue, environ
 - If recent run pattern shows solid block of failures -> likely regression or environment
 - If commit range is empty (same SHA) -> the failure predates this range, check if flaky
 - If candidate commits are empty but failures are consistent -> environment change or hardware"""
-    else:
-        methodology = """## Classification Guide
-Classify as exactly ONE of:
-- **code_regression**: A specific commit introduced this failure. Evidence: deterministic error, clear code path change, started consistently after a specific SHA. All runners affected equally.
-- **flaky_test**: Intermittent failure unrelated to code changes. Evidence: pass/fail alternation in the run pattern, non-deterministic numeric values, no clear causal commit, or the error looks like a race condition/timing issue.
-- **hardware_issue**: Failure correlates with specific runner/GPU hardware. Evidence: same SHA passes on one runner type but fails on another, or runner correlation data shows concentration on specific runners.
-- **environment_change**: External dependency change (driver update, docker image, package version bump). Evidence: no relevant code changes in the commit range, sudden onset across all tests, or error mentions version/compatibility.
-
-## Key Patterns
-- If recent run pattern shows alternating pass/fail -> likely flaky
-- If recent run pattern shows solid block of failures -> likely regression or environment
-- If commit range is empty (same SHA) -> the failure predates this range, check if flaky
-- If candidate commits are empty but failures are consistent -> environment change or hardware
-- Large numeric diffs that are identical across runs -> deterministic bug, not flaky"""
 
     return f"""You are an expert CI regression analyst for the SGLang project (a high-performance LLM serving framework).
 
@@ -1092,11 +1082,9 @@ def run_bisection_analysis(
     print("=" * 80)
 
     # Load bisect skill methodology for prompt construction
+    # Raises SkillLoadError if SKILL.md is missing or sections were renamed
     skill_content = load_bisect_skill()
-    if skill_content:
-        print(f"Loaded bisect skill ({len(skill_content)} chars)")
-    else:
-        print("Using built-in classification guide (SKILL.md not found)")
+    print(f"Loaded bisect skill ({len(skill_content)} chars)")
 
     # Fetch and analyze failures directly (no external report file needed)
     targets, logs_cache = analyze_scheduled_failures(
@@ -1155,7 +1143,7 @@ def run_bisection_analysis(
             results.append(result)
             continue
 
-        prompt = build_prompt(context)
+        prompt = build_prompt(context, skill_content)
         print(f"  Calling Claude ({CLAUDE_MODEL})...")
         response_text, tokens = call_claude_api(prompt, api_key)
         total_tokens += tokens
@@ -1291,6 +1279,31 @@ def main():
         import traceback
 
         traceback.print_exc()
+
+        # Write an error result file so the Slack notification step can
+        # report the failure instead of silently skipping
+        if args.output:
+            error_output = {
+                "analysis_timestamp": datetime.now().isoformat(),
+                "total_failures_analyzed": 0,
+                "total_tokens_used": 0,
+                "error": str(e),
+                "results": [],
+                "summary": {
+                    "code_regressions": 0,
+                    "flaky_tests": 0,
+                    "hardware_issues": 0,
+                    "environment_changes": 0,
+                    "unknown": 0,
+                },
+            }
+            try:
+                with open(args.output, "w") as f:
+                    json.dump(error_output, f, indent=2)
+                print(f"Error report saved to {args.output}")
+            except OSError:
+                pass
+
         sys.exit(1)
 
 
