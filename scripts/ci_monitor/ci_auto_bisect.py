@@ -36,6 +36,9 @@ GITHUB_API = "https://api.github.com"
 # Claude model to use
 CLAUDE_MODEL = "claude-sonnet-4-5-20250514"
 
+# Path to the bisect skill definition (relative to repo root)
+BISECT_SKILL_PATH = ".claude/skills/sglang-bisect-ci-regression/SKILL.md"
+
 # Jobs to exclude from analysis (administrative/setup, not actual tests)
 EXCLUDED_JOBS = [
     "check-changes",
@@ -730,12 +733,80 @@ def gather_bisection_context(
 
 
 # ---------------------------------------------------------------------------
+# Skill loading
+# ---------------------------------------------------------------------------
+
+
+def load_bisect_skill() -> str:
+    """Load the bisect skill SKILL.md and extract analysis methodology sections.
+
+    Reads the skill definition from the repo and extracts the sections that
+    are useful as Claude prompt context: Key Patterns, Important Notes, and
+    Report structure. This keeps the automated workflow in sync with any
+    updates to the skill definition.
+
+    Returns the extracted sections as a string, or a fallback if not found.
+    """
+    # Try repo-relative path first, then look in common locations
+    candidates = [
+        BISECT_SKILL_PATH,
+        os.path.join(os.path.dirname(__file__), "..", "..", BISECT_SKILL_PATH),
+    ]
+
+    content = ""
+    for path in candidates:
+        try:
+            with open(path) as f:
+                content = f.read()
+            break
+        except FileNotFoundError:
+            continue
+
+    if not content:
+        print(f"  Warning: Could not find {BISECT_SKILL_PATH}, using built-in prompt")
+        return ""
+
+    # Extract the useful analysis sections (skip bash commands and interactive workflow)
+    sections = []
+
+    # Extract "Key Patterns to Recognize" table
+    match = re.search(
+        r"## Key Patterns to Recognize\n(.*?)(?=\n## |\Z)", content, re.DOTALL
+    )
+    if match:
+        sections.append("## Key Patterns to Recognize\n" + match.group(1).strip())
+
+    # Extract "Important Notes"
+    match = re.search(r"## Important Notes\n(.*?)(?=\n## |\Z)", content, re.DOTALL)
+    if match:
+        sections.append("## Important Notes\n" + match.group(1).strip())
+
+    # Extract Root Cause Classification from Phase 6 report template
+    match = re.search(
+        r"### Root Cause Classification\n(.*?)(?=\n### |\Z)", content, re.DOTALL
+    )
+    if match:
+        sections.append("## Root Cause Classifications\n" + match.group(1).strip())
+
+    if not sections:
+        print("  Warning: Could not extract sections from SKILL.md")
+        return ""
+
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
 # Claude API integration
 # ---------------------------------------------------------------------------
 
 
-def build_prompt(context: BisectionContext) -> str:
-    """Build a structured prompt for Claude to analyze a CI failure."""
+def build_prompt(context: BisectionContext, skill_content: str = "") -> str:
+    """Build a structured prompt for Claude to analyze a CI failure.
+
+    Args:
+        skill_content: Extracted sections from SKILL.md to use as analysis
+            methodology. Falls back to built-in classification guide if empty.
+    """
     t = context.target
 
     statuses_str = " ".join(t.recent_run_statuses) if t.recent_run_statuses else "N/A"
@@ -761,6 +832,35 @@ def build_prompt(context: BisectionContext) -> str:
         runner_str = "\n".join(runner_lines)
 
     error_str = context.error_signature or "No error logs available"
+
+    # Use skill content if available, otherwise fall back to built-in guide
+    if skill_content:
+        methodology = f"""## Analysis Methodology
+The following analysis methodology is loaded from the project's bisect skill definition.
+Use it to guide your classification.
+
+{skill_content}
+
+## Additional Classification Guidance
+Classify as exactly ONE of: code_regression, flaky_test, hardware_issue, environment_change.
+- If recent run pattern shows alternating pass/fail -> likely flaky
+- If recent run pattern shows solid block of failures -> likely regression or environment
+- If commit range is empty (same SHA) -> the failure predates this range, check if flaky
+- If candidate commits are empty but failures are consistent -> environment change or hardware"""
+    else:
+        methodology = """## Classification Guide
+Classify as exactly ONE of:
+- **code_regression**: A specific commit introduced this failure. Evidence: deterministic error, clear code path change, started consistently after a specific SHA. All runners affected equally.
+- **flaky_test**: Intermittent failure unrelated to code changes. Evidence: pass/fail alternation in the run pattern, non-deterministic numeric values, no clear causal commit, or the error looks like a race condition/timing issue.
+- **hardware_issue**: Failure correlates with specific runner/GPU hardware. Evidence: same SHA passes on one runner type but fails on another, or runner correlation data shows concentration on specific runners.
+- **environment_change**: External dependency change (driver update, docker image, package version bump). Evidence: no relevant code changes in the commit range, sudden onset across all tests, or error mentions version/compatibility.
+
+## Key Patterns
+- If recent run pattern shows alternating pass/fail -> likely flaky
+- If recent run pattern shows solid block of failures -> likely regression or environment
+- If commit range is empty (same SHA) -> the failure predates this range, check if flaky
+- If candidate commits are empty but failures are consistent -> environment change or hardware
+- Large numeric diffs that are identical across runs -> deterministic bug, not flaky"""
 
     return f"""You are an expert CI regression analyst for the SGLang project (a high-performance LLM serving framework).
 
@@ -799,19 +899,7 @@ Analyze this CI test failure and classify its root cause. Be precise and evidenc
 
 Note: PR numbers appear in squash-merged commit messages as (#1234). Extract the PR number from the suspected commit message if possible.
 
-## Classification Guide
-Classify as exactly ONE of:
-- **code_regression**: A specific commit introduced this failure. Evidence: deterministic error, clear code path change, started consistently after a specific SHA. All runners affected equally.
-- **flaky_test**: Intermittent failure unrelated to code changes. Evidence: pass/fail alternation in the run pattern, non-deterministic numeric values, no clear causal commit, or the error looks like a race condition/timing issue.
-- **hardware_issue**: Failure correlates with specific runner/GPU hardware. Evidence: same SHA passes on one runner type but fails on another, or runner correlation data shows concentration on specific runners.
-- **environment_change**: External dependency change (driver update, docker image, package version bump). Evidence: no relevant code changes in the commit range, sudden onset across all tests, or error mentions version/compatibility.
-
-## Key Patterns
-- If recent run pattern shows alternating pass/fail -> likely flaky
-- If recent run pattern shows solid block of failures -> likely regression or environment
-- If commit range is empty (same SHA) -> the failure predates this range, check if flaky
-- If candidate commits are empty but failures are consistent -> environment change or hardware
-- Large numeric diffs that are identical across runs -> deterministic bug, not flaky
+{methodology}
 
 ## Required Output
 Respond with ONLY a JSON object (no markdown fencing, no extra text):
@@ -1003,6 +1091,13 @@ def run_bisection_analysis(
     print("SGLang CI Auto Bisect")
     print("=" * 80)
 
+    # Load bisect skill methodology for prompt construction
+    skill_content = load_bisect_skill()
+    if skill_content:
+        print(f"Loaded bisect skill ({len(skill_content)} chars)")
+    else:
+        print("Using built-in classification guide (SKILL.md not found)")
+
     # Fetch and analyze failures directly (no external report file needed)
     targets, logs_cache = analyze_scheduled_failures(
         github_token, min_streak, max_failures
@@ -1047,7 +1142,7 @@ def run_bisection_analysis(
         context = gather_bisection_context(target, github_token, logs_cache)
 
         if dry_run:
-            prompt = build_prompt(context)
+            prompt = build_prompt(context, skill_content)
             print("  [DRY RUN] Skipping Claude API call")
             print(f"  Prompt length: {len(prompt)} chars")
             result = BisectionResult(
