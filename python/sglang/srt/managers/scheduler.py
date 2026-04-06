@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import atexit
 import faulthandler
 import logging
 import os
@@ -3608,6 +3609,35 @@ def run_scheduler_process(
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
+
+        # Register RDMA cleanup for disaggregation modes only.
+        # This ensures RDMA memory is deregistered and ZMQ sockets are closed
+        # when the scheduler process exits, preventing Kubernetes pod sandbox
+        # teardown hangs (FailedKillPod).
+        if scheduler.disaggregation_mode != DisaggregationMode.NULL:
+
+            def _shutdown_kv_manager():
+                try:
+                    kv_mgr = None
+                    if hasattr(scheduler, "disagg_prefill_bootstrap_queue"):
+                        kv_mgr = scheduler.disagg_prefill_bootstrap_queue.kv_manager
+                    elif hasattr(scheduler, "disagg_decode_prealloc_queue"):
+                        kv_mgr = scheduler.disagg_decode_prealloc_queue.kv_manager
+                    if kv_mgr is not None and hasattr(kv_mgr, "shutdown"):
+                        kv_mgr.shutdown()
+                except Exception as e:
+                    logger.warning(f"Error during KV manager shutdown: {e}")
+
+            atexit.register(_shutdown_kv_manager)
+
+            # Register SIGTERM handler so atexit handlers run on graceful shutdown.
+            # Without this, SIGTERM uses the default handler (immediate exit) which
+            # skips atexit/destructors, leaving RDMA resources unreleased.
+            def _sigterm_handler(signum, frame):
+                logger.info("Scheduler received SIGTERM, exiting gracefully...")
+                sys.exit(143)  # 128 + SIGTERM(15)
+
+            signal.signal(signal.SIGTERM, _sigterm_handler)
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()

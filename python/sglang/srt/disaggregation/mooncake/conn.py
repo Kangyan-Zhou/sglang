@@ -276,6 +276,47 @@ class MooncakeKVManager(CommonKVManager):
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             )
 
+    def shutdown(self):
+        """Deregister RDMA memory and close ZMQ sockets for clean process exit.
+
+        Without explicit deregistration, Mooncake's C++ TransferEngine destructor
+        must tear down RDMA resources during process exit. In Kubernetes, this can
+        cause pod sandbox teardown to hang with FailedKillPod errors.
+        """
+        logger.info("MooncakeKVManager shutting down...")
+
+        # 1. Close ZMQ sockets to unblock threads waiting on recv_multipart()
+        super().shutdown()
+
+        # 2. Shut down thread pool executors first to stop in-flight transfers
+        #    before deregistering the memory they may be reading from.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for executor in getattr(self, "executors", []):
+                try:
+                    executor.shutdown(wait=False)
+                except Exception as e:
+                    logger.warning(f"Failed to shut down thread pool executor: {e}")
+
+        # 3. Deregister RDMA memory regions (mirror registration conditions)
+        if self.engine is not None:
+            try:
+                if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
+                    self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+            except Exception as e:
+                logger.warning(f"Failed to deregister KV data buffers: {e}")
+            try:
+                if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
+                    self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+            except Exception as e:
+                logger.warning(f"Failed to deregister aux data buffers: {e}")
+            try:
+                if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
+                    self.engine.batch_deregister(self.kv_args.state_data_ptrs)
+            except Exception as e:
+                logger.warning(f"Failed to deregister state data buffers: {e}")
+
+        logger.info("MooncakeKVManager shutdown complete.")
+
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
     # ------------------------------------------------------------------
@@ -1420,7 +1461,7 @@ class MooncakeKVManager(CommonKVManager):
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        threading.Thread(target=bootstrap_thread, daemon=True).start()
 
     def start_decode_thread(self):
         def decode_thread():
@@ -1548,8 +1589,8 @@ class MooncakeKVManager(CommonKVManager):
                             if bootstrap_addr in self.session_pool:
                                 del self.session_pool[bootstrap_addr]
 
-        threading.Thread(target=decode_thread).start()
-        threading.Thread(target=heartbeat_checker).start()
+        threading.Thread(target=decode_thread, daemon=True).start()
+        threading.Thread(target=heartbeat_checker, daemon=True).start()
 
     def add_transfer_request(
         self,

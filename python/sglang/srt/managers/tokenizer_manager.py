@@ -103,6 +103,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
+    graceful_kill_process_tree,
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
@@ -121,6 +122,10 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+# Constants for graceful shutdown configuration
+CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV = "SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT"
+DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT = 10.0
 
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
@@ -2199,8 +2204,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 self.dump_requests_before_crash()
                 break
 
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(0)
+        # Gracefully terminate child processes (e.g., scheduler, detokenizer)
+        # by first sending SIGTERM to allow cleanup (RDMA deregistration, etc.),
+        # then SIGKILL after timeout if they don't exit.
+        shutdown_timeout = float(
+            os.environ.get(
+                CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV,
+                DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT,
+            )
+        )
+        graceful_kill_process_tree(
+            os.getpid(), include_parent=False, timeout=shutdown_timeout
+        )
+        # Use os._exit() instead of sys.exit() to avoid SystemExit exception
+        # being caught by asyncio event loop, which would interrupt FastAPI's
+        # lifespan cleanup and prevent graceful shutdown of uvicorn server.
+        os._exit(0)
 
     def force_exit_handler(self):
         """Put some custom force exit logic here."""
