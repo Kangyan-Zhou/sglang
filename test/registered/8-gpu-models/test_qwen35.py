@@ -9,7 +9,7 @@ from sglang.test.test_utils import ModelLaunchSettings
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
-QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B"
+QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B-FP8"
 
 
 class TestQwen35(unittest.TestCase):
