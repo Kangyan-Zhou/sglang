@@ -30,6 +30,7 @@ class TestQwen35(unittest.TestCase):
             "--tool-call-parser=qwen3_coder",
             "--mem-fraction-static=0.8",
         ]
+        dp_args = ["--dp=8", "--enable-dp-attention"]
         mtp_args = [
             "--speculative-algorithm=EAGLE",
             "--speculative-num-steps=3",
@@ -48,8 +49,14 @@ class TestQwen35(unittest.TestCase):
             ModelLaunchSettings(
                 QWEN35_MODEL_PATH,
                 tp_size=8,
-                extra_args=base_args + mtp_args,
-                variant="TP8+MTP",
+                extra_args=base_args + dp_args,
+                variant="TP8+DP8",
+            ),
+            ModelLaunchSettings(
+                QWEN35_MODEL_PATH,
+                tp_size=8,
+                extra_args=base_args + dp_args + mtp_args,
+                variant="TP8+DP8+MTP",
                 env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
