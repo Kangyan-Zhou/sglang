@@ -30,7 +30,7 @@ MTP_ARGS = [
 
 
 class TestGlm5Nvfp4(unittest.TestCase):
-    """GLM-5 NVFP4 on GB300 (4x B200 NVL4, tp=4)."""
+    """GLM-5.1 NVFP4 on GB300 (4x B200 NVL4, tp=4)."""
 
     def test_glm5_nvfp4(self):
         variants = [
@@ -59,7 +59,7 @@ class TestGlm5Nvfp4(unittest.TestCase):
 
         run_combined_tests(
             models=variants,
-            test_name="GLM-5-NVFP4",
+            test_name="GLM-5.1-NVFP4",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",
