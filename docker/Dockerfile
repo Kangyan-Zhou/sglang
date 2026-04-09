@@ -218,13 +218,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
+    && kernels lock python \
     && ( success=0; for i in 1 2 3; do \
         echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
         kernels download python && \
         success=1 && break; \
         echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
     done; [ "$success" = "1" ] ) \
-    && kernels lock python \
     && mv python/kernels.lock /root/.cache/sglang
 
 # DeepEP
