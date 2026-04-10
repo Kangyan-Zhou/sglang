@@ -30,7 +30,7 @@ on:
 jobs:
   cleanup:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Cleanup old nightly tags
         env:

@@ -21,7 +21,7 @@ concurrency:
 jobs:
   prepare:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     outputs:
       checkout_ref: ${{ steps.config.outputs.checkout_ref }}
       extra_build_args: ${{ steps.config.outputs.extra_build_args }}

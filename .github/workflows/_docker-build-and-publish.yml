@@ -224,7 +224,7 @@ jobs:
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
   create-manifests:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: [build-x86, build-arm64]
     if: github.repository == 'sgl-project/sglang'
     environment: ${{ inputs.use_environment || null }}
