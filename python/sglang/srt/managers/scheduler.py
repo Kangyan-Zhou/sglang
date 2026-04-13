@@ -2044,22 +2044,57 @@ class Scheduler(
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_disagg_queued_limit(self, recv_req: Req) -> bool:
-        """Abort an incoming request if disagg queues exceed max_queued_requests. Returns True if aborted."""
+        """Abort an incoming request if disagg queues exceed max_queued_requests.
+
+        Counts requests across ALL disaggregation pipeline stages, not just the
+        waiting queue. In PD mode the bottleneck is typically the bootstrap/prealloc
+        queue (where requests wait for cross-engine handshakes and KV cache
+        allocation), so checking only waiting_queue misses the real backlog.
+
+        Returns True if the incoming request is aborted.
+        """
         if not self.server_args.grpc_mode:
             return False
         if self.max_queued_requests is None:
             return False
 
-        total_queued = len(self.waiting_queue)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            bootstrap_depth = len(self.disagg_prefill_bootstrap_queue.queue)
+            waiting_depth = len(self.waiting_queue)
+            inflight_depth = len(self.disagg_prefill_inflight_queue)
+            total_queued = bootstrap_depth + waiting_depth + inflight_depth
+            detail = (
+                f"bootstrap={bootstrap_depth}, waiting={waiting_depth}, "
+                f"inflight={inflight_depth}"
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc_depth = len(self.disagg_decode_prealloc_queue.queue)
+            pending_depth = len(self.disagg_decode_prealloc_queue.pending_reqs)
+            transfer_depth = len(self.disagg_decode_prealloc_queue.transfer_queue.queue)
+            waiting_depth = len(self.waiting_queue)
+            total_queued = (
+                prealloc_depth + pending_depth + transfer_depth + waiting_depth
+            )
+            detail = (
+                f"prealloc={prealloc_depth}, pending={pending_depth}, "
+                f"transfer={transfer_depth}, waiting={waiting_depth}"
+            )
+        else:
+            total_queued = len(self.waiting_queue)
+            detail = f"waiting={total_queued}"
+
         logger.debug(
             f"Disagg {self.disaggregation_mode.name.lower()} admission check: "
-            f"waiting_queue={total_queued}, limit={self.max_queued_requests}"
+            f"total={total_queued} ({detail}), limit={self.max_queued_requests}"
         )
 
         if total_queued < self.max_queued_requests:
             return False
 
-        message = f"The disaggregation request queue is full (depth {total_queued}, limit {self.max_queued_requests})."
+        message = (
+            f"The disaggregation request queue is full "
+            f"(total={total_queued} [{detail}], limit={self.max_queued_requests})."
+        )
         logger.warning(f"Rejecting request {recv_req.rid}: {message}")
         self.send_to_detokenizer.send_output(
             AbortReq(
