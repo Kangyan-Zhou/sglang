@@ -4521,7 +4521,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.grpc_http_sidecar_port,
             help="Port for the HTTP sidecar server in gRPC mode (--grpc-mode). "
-            "Serves Prometheus metrics, profiling, and server_info endpoints. "
+            "Serves Prometheus metrics and profiling endpoints. "
             "Defaults to --port + 1. Not used in HTTP mode.",
         )
         parser.add_argument(

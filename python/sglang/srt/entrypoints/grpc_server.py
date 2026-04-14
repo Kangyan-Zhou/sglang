@@ -4,13 +4,9 @@ Thin gRPC server wrapper — delegates to smg-grpc-servicer package.
 A lightweight HTTP sidecar is started alongside the gRPC server to expose:
 - /metrics (Prometheus, when --enable-metrics is set)
 - /start_profile, /stop_profile (profiling control, for direct engine access)
-- /server_info (server configuration and internal state)
 
 The sidecar always starts on --grpc-http-sidecar-port (default: --port + 1),
 even if --enable-metrics is not set, to serve these endpoints.
-
-Note: /flush_cache is served natively via the FlushCache gRPC RPC (proxied
-by the SMG router's HTTP /flush_cache endpoint).
 """
 
 import logging
@@ -62,29 +58,23 @@ def _add_metrics_routes(app):
     app.router.add_get("/metrics", metrics_handler)
 
 
-def _add_admin_routes(app, request_manager, server_args, scheduler_info):
+def _add_admin_routes(app, request_manager):
     """Add admin endpoints to the aiohttp app.
 
-    Endpoints: /start_profile, /stop_profile, /server_info.
+    Endpoints: /start_profile, /stop_profile.
     Business logic (request construction, env var handling, response interpretation)
     lives here; request_manager only provides the ZMQ transport layer.
-
-    Note: /flush_cache is handled natively via the FlushCache gRPC RPC.
     """
-    import dataclasses
     import json
     import time
-    from functools import partial
 
     from aiohttp import web
 
     from sglang.srt.managers.io_struct import (
-        GetInternalStateReq,
         ProfileReq,
         ProfileReqType,
     )
     from sglang.srt.utils.common import get_bool_env_var
-    from sglang.version import __version__
 
     async def start_profile_handler(request):
         try:
@@ -154,36 +144,8 @@ def _add_admin_routes(app, request_manager, server_args, scheduler_info):
             logger.exception("Failed to stop profile")
             return web.Response(status=500, text=str(e))
 
-    async def server_info_handler(request):
-        try:
-            results = await request_manager.send_communicator_req(
-                GetInternalStateReq(), "get_internal_state_communicator"
-            )
-            internal_states = [r.internal_state for r in results] if results else []
-            # Serialize server_args safely without mutating the shared object
-            import copy
-
-            args_copy = copy.copy(server_args)
-            for attr in ("model_config", "custom_sigquit_handler"):
-                if hasattr(args_copy, attr):
-                    delattr(args_copy, attr)
-            server_args_dict = dataclasses.asdict(args_copy)
-            return web.json_response(
-                {
-                    **server_args_dict,
-                    **scheduler_info,
-                    "internal_states": internal_states,
-                    "version": __version__,
-                },
-                dumps=partial(json.dumps, default=str),
-            )
-        except Exception as e:
-            logger.exception("Failed to get server info")
-            return web.json_response({"error": str(e)}, status=500)
-
     app.router.add_post("/start_profile", start_profile_handler)
     app.router.add_post("/stop_profile", stop_profile_handler)
-    app.router.add_get("/server_info", server_info_handler)
 
 
 async def serve_grpc(server_args, model_info=None):
@@ -227,7 +189,7 @@ async def serve_grpc(server_args, model_info=None):
     async def _on_request_manager_ready(request_manager, srv_args, sched_info):
         nonlocal sidecar_runner
         try:
-            _add_admin_routes(sidecar_app, request_manager, srv_args, sched_info)
+            _add_admin_routes(sidecar_app, request_manager)
         except Exception as e:
             logger.error(
                 "Failed to set up admin routes: %s. "
