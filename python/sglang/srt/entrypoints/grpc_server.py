@@ -3,21 +3,27 @@ Thin gRPC server wrapper — delegates to smg-grpc-servicer package.
 
 A lightweight HTTP sidecar is started alongside the gRPC server to expose:
 - /metrics (Prometheus, when --enable-metrics is set)
-- /start_profile, /stop_profile (profiling control, for direct engine access)
+- /start_profile, /stop_profile (profiling control)
 
-The sidecar always starts on --grpc-http-sidecar-port (default: --port + 1),
-even if --enable-metrics is not set, to serve these endpoints.
+The sidecar is started on --grpc-http-sidecar-port (default: --port + 1)
+once the gRPC request manager is ready, regardless of whether --enable-metrics
+is set.
 """
 
+import json
 import logging
+import time
+
+from aiohttp import web
+
+from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
 
 async def _start_sidecar_server(host: str, port: int, app):
     """Start the aiohttp sidecar and return the runner for cleanup."""
-    from aiohttp import web
-
     runner = web.AppRunner(app)
     await runner.setup()
     try:
@@ -32,7 +38,6 @@ async def _start_sidecar_server(host: str, port: int, app):
 
 def _add_metrics_routes(app):
     """Add Prometheus /metrics endpoint to the aiohttp app."""
-    from aiohttp import web
     from prometheus_client import (
         CollectorRegistry,
         multiprocess,
@@ -58,30 +63,31 @@ def _add_metrics_routes(app):
     app.router.add_get("/metrics", metrics_handler)
 
 
+def _check_communicator_results(results, action):
+    """Return a web.Response error if results indicate failure, else None."""
+    if not results:
+        return web.Response(status=500, text="No response from scheduler\n")
+    failures = [r for r in results if not r.success]
+    if failures:
+        msgs = " | ".join(r.message for r in failures)
+        return web.Response(status=500, text=f"{action} failed: {msgs}\n")
+    return None
+
+
 def _add_admin_routes(app, request_manager):
     """Add admin endpoints to the aiohttp app.
 
     Endpoints: /start_profile, /stop_profile.
     Business logic (request construction, env var handling, response interpretation)
-    lives here; request_manager only provides the ZMQ transport layer.
+    lives here; request_manager only provides the transport to the scheduler.
     """
-    import json
-    import time
-
-    from aiohttp import web
-
-    from sglang.srt.managers.io_struct import (
-        ProfileReq,
-        ProfileReqType,
-    )
-    from sglang.srt.utils.common import get_bool_env_var
 
     async def start_profile_handler(request):
         try:
             if request.content_length and request.content_length > 0:
                 try:
                     body = await request.json()
-                except (json.JSONDecodeError, Exception) as e:
+                except json.JSONDecodeError as e:
                     return web.Response(
                         status=400,
                         text=f"Invalid JSON in request body: {e}",
@@ -92,9 +98,7 @@ def _add_admin_routes(app, request_manager):
             # Build ProfileReq with env var overrides (same as tokenizer_communicator_mixin)
             with_stack = body.get("with_stack")
             env_with_stack = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
-            with_stack = (
-                False if with_stack is False or env_with_stack is False else True
-            )
+            with_stack = (with_stack is not False) and env_with_stack
             record_shapes = body.get("record_shapes")
             env_record_shapes = get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", "true")
             record_shapes = (record_shapes is not False) and env_record_shapes
@@ -116,16 +120,16 @@ def _add_admin_routes(app, request_manager):
             results = await request_manager.send_communicator_req(
                 req, "profile_communicator", timeout=600.0
             )
-            if not results:
-                return web.Response(status=500, text="No response from scheduler\n")
-            failures = [r for r in results if not r.success]
-            if failures:
-                msgs = " | ".join(r.message for r in failures)
-                return web.Response(status=500, text=f"Profile failed: {msgs}\n")
+            err = _check_communicator_results(results, "Start Profile")
+            if err:
+                return err
             return web.Response(text="Start profiling.\n")
         except Exception as e:
             logger.exception("Failed to start profile")
-            return web.Response(status=500, text=str(e))
+            return web.Response(
+                status=500,
+                text=f"Internal error: {type(e).__name__}. Check server logs.\n",
+            )
 
     async def stop_profile_handler(request):
         try:
@@ -133,16 +137,16 @@ def _add_admin_routes(app, request_manager):
             results = await request_manager.send_communicator_req(
                 req, "profile_communicator", timeout=600.0
             )
-            if not results:
-                return web.Response(status=500, text="No response from scheduler\n")
-            failures = [r for r in results if not r.success]
-            if failures:
-                msgs = " | ".join(r.message for r in failures)
-                return web.Response(status=500, text=f"Stop profile failed: {msgs}\n")
+            err = _check_communicator_results(results, "Stop profile")
+            if err:
+                return err
             return web.Response(text="Stop profiling. This will take some time.\n")
         except Exception as e:
             logger.exception("Failed to stop profile")
-            return web.Response(status=500, text=str(e))
+            return web.Response(
+                status=500,
+                text=f"Internal error: {type(e).__name__}. Check server logs.\n",
+            )
 
     app.router.add_post("/start_profile", start_profile_handler)
     app.router.add_post("/stop_profile", stop_profile_handler)
@@ -160,12 +164,12 @@ async def serve_grpc(server_args, model_info=None):
             "version mismatch — see the chained exception above for details."
         ) from e
 
-    from aiohttp import web
-
     sidecar_app = web.Application()
     sidecar_runner = None
     sidecar_port = (
-        getattr(server_args, "grpc_http_sidecar_port", None) or server_args.port + 1
+        server_args.grpc_http_sidecar_port
+        if server_args.grpc_http_sidecar_port is not None
+        else server_args.port + 1
     )
 
     # Metrics setup: must set PROMETHEUS_MULTIPROC_DIR before scheduler
