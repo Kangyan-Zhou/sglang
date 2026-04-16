@@ -314,6 +314,9 @@ def validate_dflash_request(req: Req) -> Optional[str]:
     return None
 
 
+_PREFILL_RESERVE_PEEK_K = 8
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -2390,46 +2393,35 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def _compute_prefill_warm_reserve(self, chunked_prefill_size: int) -> int:
-        """Sum the page-aligned uncached-prefill length of top-K warm waiting requests.
+    def _compute_prefill_reserve(self, chunked_prefill_size: int) -> int:
+        """Return page-aligned total extend of top-K waiting reqs that fit in the reserve budget.
 
-        Uses the prefix_indices already populated by SchedulePolicy.calc_priority,
-        so no extra radix lookup is done here. A request is "warm" if its
-        uncached length fits under --prefill-warm-extend-threshold. Each
-        candidate's contribution is ceil-page-aligned so the leftover budget
-        handed to add_chunked_req is also page-aligned. The total reserve is
-        capped by --prefill-max-warm-reserve and by (chunked_prefill_size - page_size)
-        so the chunked request always makes forward progress.
-
-        Returns 0 when the feature is disabled or no warm requests are waiting,
-        so behavior is unchanged in the common case.
+        Uses prefix_indices populated by SchedulePolicy.calc_priority, so no extra
+        radix lookup. A waiting req contributes its ceil-page-aligned extend if,
+        together with prior contributions, it fits in --prefill-reserve-budget
+        (and in chunked_prefill_size minus one page, so the chunked req keeps
+        forward progress). Returns 0 when the feature is disabled or no req fits.
         """
-        if not self.server_args.enable_prefill_warm_reserve:
+        budget = self.server_args.prefill_reserve_budget
+        if budget <= 0:
             return 0
 
-        threshold = self.server_args.prefill_warm_extend_threshold
-        max_reserve = self.server_args.prefill_max_warm_reserve
-        peek_k = self.server_args.prefill_warm_peek_k
         page_size = self.page_size
-        upper_cap = max(0, chunked_prefill_size - page_size)
+        budget = min(budget, max(0, chunked_prefill_size - page_size))
+        if budget <= 0:
+            return 0
 
         reserve = 0
-        for req in self.waiting_queue[:peek_k]:
-            # prefix_indices is set by calc_priority on CacheAwarePolicy paths;
-            # on FCFS/other agnostic paths it may be empty, which is fine —
-            # extend is then just len(origin_input_ids) and such long requests
-            # will not qualify as warm under the threshold.
+        for req in self.waiting_queue[:_PREFILL_RESERVE_PEEK_K]:
             extend = len(req.origin_input_ids) - len(req.prefix_indices)
-            if 0 < extend <= threshold:
-                # Ceil-page-align so the leftover handed to add_chunked_req
-                # stays a multiple of page_size, matching existing invariants.
-                page_aligned = -(-extend // page_size) * page_size
-                reserve += page_aligned
-                if reserve >= max_reserve:
-                    reserve = max_reserve
-                    break
+            if extend <= 0:
+                continue
+            page_aligned = -(-extend // page_size) * page_size
+            if reserve + page_aligned > budget:
+                continue
+            reserve += page_aligned
 
-        return min(reserve, upper_cap)
+        return reserve
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
@@ -2522,10 +2514,8 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            warm_reserve = self._compute_prefill_warm_reserve(chunked_prefill_size)
-            max_chunk_tokens = (
-                chunked_prefill_size - warm_reserve if warm_reserve > 0 else None
-            )
+            reserve = self._compute_prefill_reserve(chunked_prefill_size)
+            max_chunk_tokens = chunked_prefill_size - reserve if reserve > 0 else None
             self.chunked_req = adder.add_chunked_req(
                 self.chunked_req, max_chunk_tokens=max_chunk_tokens
             )
