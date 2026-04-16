@@ -2398,7 +2398,7 @@ class Scheduler(
         uncached length fits under --prefill-warm-extend-threshold. Each
         candidate's contribution is ceil-page-aligned so the leftover budget
         handed to add_chunked_req is also page-aligned. The total reserve is
-        capped by --prefill-max-warm-reserve and by (chunked_prefill_size - 1)
+        capped by --prefill-max-warm-reserve and by (chunked_prefill_size - page_size)
         so the chunked request always makes forward progress.
 
         Returns 0 when the feature is disabled or no warm requests are waiting,
