@@ -6548,6 +6548,21 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        # Check prefill adaptive warm-reserve tunables
+        if self.enable_prefill_warm_reserve:
+            assert (
+                self.prefill_warm_extend_threshold > 0
+            ), "--prefill-warm-extend-threshold must be > 0"
+            assert (
+                self.prefill_max_warm_reserve > 0
+            ), "--prefill-max-warm-reserve must be > 0"
+            assert self.prefill_warm_peek_k > 0, "--prefill-warm-peek-k must be > 0"
+            if self.chunked_prefill_size is not None and self.chunked_prefill_size > 0:
+                assert self.prefill_max_warm_reserve < self.chunked_prefill_size, (
+                    "--prefill-max-warm-reserve must be < --chunked-prefill-size "
+                    "so the chunked request can still make progress"
+                )
+
         # Check pdmux
         if self.enable_pdmux:
             assert (
