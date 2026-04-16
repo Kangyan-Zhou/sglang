@@ -543,6 +543,41 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(chunked.extend_input_len, 1, "floor at 1 must apply")
         self.assertEqual(adder.rem_chunk_tokens, 8192 - 1)
 
+    def test_add_one_req_with_has_chunked_req_refuses_second_chunked(self):
+        """When a chunked_req is already in flight (has_chunked_req=True) and a
+        new waiting req is too big to fit in leftover rem_chunk_tokens, add_one_req
+        must return OTHER instead of promoting it to a second chunked_req. This
+        protects the chunked_req singleton invariant.
+        """
+        running_batch = self.create_running_batch([])
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=3000,  # simulating leftover after an earlier add_chunked_req
+        )
+
+        new_req = self.create_mock_req("w1", priority=0, max_new_tokens=16)
+        new_req.extend_input_len = 5000
+        new_req.prefix_indices = []
+        new_req.fill_ids = [0] * 5000
+        new_req.origin_input_ids = [0] * 5000
+        new_req.host_hit_length = 0
+        new_req.last_node = MagicMock()
+        new_req.set_extend_input_len = lambda n: setattr(new_req, "extend_input_len", n)
+        new_req.cache_protected_len = 0
+        new_req.sampling_params.ignore_eos = False
+
+        result = adder.add_one_req(
+            new_req, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertIsNone(
+            adder.new_chunked_req, "must not promote to second chunked_req"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
