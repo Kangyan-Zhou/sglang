@@ -79,6 +79,20 @@ class TestPrefillAdder(CustomTestCase):
         req.finished.return_value = False
         return req
 
+    def create_chunked_req(self, rid, remaining_extend):
+        """Build a req that looks like a mid-chunk chunked_req.
+
+        remaining_extend is how many more tokens are left to prefill for this
+        request. The req will be handed to add_chunked_req which may consume
+        all or part of that amount depending on rem_chunk_tokens / max_chunk_tokens.
+        """
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=16)
+        req.extend_input_len = remaining_extend
+        req.prefix_indices = []
+        req.fill_ids = [0] * remaining_extend
+        req.set_extend_input_len = lambda n: setattr(req, "extend_input_len", n)
+        return req
+
     def create_adder(self, running_batch, **kwargs):
         defaults = dict(
             page_size=1,
@@ -441,6 +455,72 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_add_chunked_req_default_consumes_full_budget(self):
+        """With max_chunk_tokens=None (default), add_chunked_req consumes the full
+        rem_chunk_tokens budget when the request still has more tokens to prefill.
+        """
+        running_batch = self.create_running_batch([])
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=8192,
+        )
+
+        chunked = self.create_chunked_req("c1", remaining_extend=50_000)
+
+        remaining_req = adder.add_chunked_req(chunked)
+
+        self.assertIs(
+            remaining_req, chunked, "req should remain truncated (not finished)"
+        )
+        self.assertEqual(chunked.extend_input_len, 8192)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+
+    def test_add_chunked_req_max_chunk_tokens_caps_consumption(self):
+        """When max_chunk_tokens is smaller than rem_chunk_tokens, the chunk is
+        capped and leftover rem_chunk_tokens is available for subsequent add_one_req
+        calls in the same step.
+        """
+        running_batch = self.create_running_batch([])
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=8192,
+        )
+
+        chunked = self.create_chunked_req("c1", remaining_extend=50_000)
+
+        remaining_req = adder.add_chunked_req(chunked, max_chunk_tokens=4915)
+
+        self.assertIs(remaining_req, chunked)
+        self.assertEqual(chunked.extend_input_len, 4915)
+        self.assertEqual(adder.rem_chunk_tokens, 8192 - 4915)
+
+    def test_add_chunked_req_cap_larger_than_remaining_finishes_req(self):
+        """If max_chunk_tokens exceeds the req's remaining extend, the req finishes
+        (add_chunked_req returns None) and only the actual extend is consumed.
+        """
+        running_batch = self.create_running_batch([])
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=8192,
+        )
+
+        chunked = self.create_chunked_req("c1", remaining_extend=500)
+
+        remaining_req = adder.add_chunked_req(chunked, max_chunk_tokens=4915)
+
+        self.assertIsNone(remaining_req, "req should finish, not remain chunked")
+        self.assertEqual(chunked.extend_input_len, 500)
+        self.assertEqual(adder.rem_chunk_tokens, 8192 - 500)
 
 
 if __name__ == "__main__":
