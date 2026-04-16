@@ -862,6 +862,14 @@ class PrefillAdder:
                     ),
                 )
             else:
+                # Enforce the chunked_req singleton invariant. The scheduler assumes
+                # at most one chunked_req per step; creating a second would trip the
+                # assertion in get_new_batch_prefill. Historically this was guaranteed
+                # by add_chunked_req consuming the full rem_chunk_tokens, but with the
+                # adaptive warm-reserve feature there can be leftover budget here.
+                if has_chunked_req:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
