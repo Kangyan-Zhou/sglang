@@ -686,7 +686,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         paged_input = self.ceil_paged_tokens(req.extend_input_len)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
@@ -760,6 +760,12 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
+            # Same chunked_req singleton invariant protection as add_one_req.
+            # The scheduler asserts at most one chunked_req per step; creating a
+            # second would trip the assertion in get_new_batch_prefill.
+            if has_chunked_req:
+                return AddReqResult.OTHER
+
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
@@ -798,7 +804,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req=has_chunked_req)
 
         # Reserve page_size for page-alignment overhead. The paged allocator
         # may consume up to one extra page per request (see alloc_extend), and

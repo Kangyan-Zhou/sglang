@@ -578,6 +578,39 @@ class TestPrefillAdder(CustomTestCase):
             adder.new_chunked_req, "must not promote to second chunked_req"
         )
 
+    def test_add_one_req_ignore_eos_with_has_chunked_req_refuses_second_chunked(self):
+        """Mirror of the add_one_req gate test, but through the ignore_eos + disabled
+        tree_cache path. Both sibling promotion paths must respect the chunked_req
+        singleton invariant.
+        """
+        self.mock_tree_cache.disable = True
+        running_batch = self.create_running_batch([])
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=3000,
+        )
+
+        new_req = self.create_mock_req("w1", priority=0, max_new_tokens=16)
+        new_req.extend_input_len = 5000
+        new_req.prefix_indices = []
+        new_req.fill_ids = [0] * 5000
+        new_req.origin_input_ids = [0] * 5000
+        new_req.host_hit_length = 0
+        new_req.last_node = MagicMock()
+        new_req.set_extend_input_len = lambda n: setattr(new_req, "extend_input_len", n)
+        new_req.cache_protected_len = 0
+        new_req.sampling_params.ignore_eos = True
+
+        result = adder.add_one_req(
+            new_req, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertIsNone(adder.new_chunked_req, "must not promote via ignore_eos path")
+
 
 if __name__ == "__main__":
     unittest.main()
