@@ -2390,6 +2390,47 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _compute_prefill_warm_reserve(self, chunked_prefill_size: int) -> int:
+        """Sum the page-aligned uncached-prefill length of top-K warm waiting requests.
+
+        Uses the prefix_indices already populated by SchedulePolicy.calc_priority,
+        so no extra radix lookup is done here. A request is "warm" if its
+        uncached length fits under --prefill-warm-extend-threshold. Each
+        candidate's contribution is ceil-page-aligned so the leftover budget
+        handed to add_chunked_req is also page-aligned. The total reserve is
+        capped by --prefill-max-warm-reserve and by (chunked_prefill_size - 1)
+        so the chunked request always makes forward progress.
+
+        Returns 0 when the feature is disabled or no warm requests are waiting,
+        so behavior is unchanged in the common case.
+        """
+        if not self.server_args.enable_prefill_warm_reserve:
+            return 0
+
+        threshold = self.server_args.prefill_warm_extend_threshold
+        max_reserve = self.server_args.prefill_max_warm_reserve
+        peek_k = self.server_args.prefill_warm_peek_k
+        page_size = self.page_size
+        upper_cap = max(0, chunked_prefill_size - page_size)
+
+        reserve = 0
+        for req in self.waiting_queue[:peek_k]:
+            # prefix_indices is set by calc_priority on CacheAwarePolicy paths;
+            # on FCFS/other agnostic paths it may be empty, which is fine —
+            # extend is then just len(origin_input_ids) and such long requests
+            # will not qualify as warm under the threshold.
+            extend = len(req.origin_input_ids) - len(req.prefix_indices)
+            if 0 < extend <= threshold:
+                # Ceil-page-align so the leftover handed to add_chunked_req
+                # stays a multiple of page_size, matching existing invariants.
+                page_aligned = -(-extend // page_size) * page_size
+                reserve += page_aligned
+                if reserve >= max_reserve:
+                    reserve = max_reserve
+                    break
+
+        return min(reserve, upper_cap)
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2481,7 +2522,13 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            warm_reserve = self._compute_prefill_warm_reserve(chunked_prefill_size)
+            max_chunk_tokens = (
+                chunked_prefill_size - warm_reserve if warm_reserve > 0 else None
+            )
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, max_chunk_tokens=max_chunk_tokens
+            )
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
