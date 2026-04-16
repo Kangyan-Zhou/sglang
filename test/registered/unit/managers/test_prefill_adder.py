@@ -522,6 +522,27 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(chunked.extend_input_len, 500)
         self.assertEqual(adder.rem_chunk_tokens, 8192 - 500)
 
+    def test_add_chunked_req_zero_cap_floors_at_one_token(self):
+        """max_chunk_tokens=0 must still admit at least one token so the chunked
+        request always makes forward progress (deliberate floor in add_chunked_req).
+        """
+        running_batch = self.create_running_batch([])
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=8192,
+        )
+
+        chunked = self.create_chunked_req("c1", remaining_extend=50_000)
+
+        remaining_req = adder.add_chunked_req(chunked, max_chunk_tokens=0)
+
+        self.assertIs(remaining_req, chunked, "req should remain chunked")
+        self.assertEqual(chunked.extend_input_len, 1, "floor at 1 must apply")
+        self.assertEqual(adder.rem_chunk_tokens, 8192 - 1)
+
 
 if __name__ == "__main__":
     unittest.main()
