@@ -347,6 +347,15 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
+    # Adaptive warm-reserve for chunked prefill. When enabled, the scheduler
+    # caps the per-step chunk size of an in-flight chunked request to leave
+    # room for waiting requests with small uncached-prefill length (warm cache
+    # hits). Designed for multi-turn agentic workloads where shorter-compute
+    # requests should not be head-of-line blocked by a cold long request.
+    enable_prefill_warm_reserve: bool = False
+    prefill_warm_extend_threshold: int = 2048
+    prefill_max_warm_reserve: int = 4096
+    prefill_warm_peek_k: int = 8
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
@@ -4263,6 +4272,38 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-prefill-warm-reserve",
+            action="store_true",
+            default=ServerArgs.enable_prefill_warm_reserve,
+            help="Enable adaptive warm-reserve for chunked prefill. When set, the "
+            "scheduler caps each per-step chunk of an in-flight chunked request "
+            "to leave room for waiting requests whose uncached-prefill length is "
+            "small enough to finish in the same forward pass. Useful for multi-turn "
+            "agentic workloads with a mix of cold and warm requests.",
+        )
+        parser.add_argument(
+            "--prefill-warm-extend-threshold",
+            type=int,
+            default=ServerArgs.prefill_warm_extend_threshold,
+            help="A waiting request is considered 'warm' only if its uncached-prefill "
+            "length (origin_input_ids minus matched prefix) is <= this many tokens. "
+            "Only warm requests are counted toward the reserve.",
+        )
+        parser.add_argument(
+            "--prefill-max-warm-reserve",
+            type=int,
+            default=ServerArgs.prefill_max_warm_reserve,
+            help="Maximum total tokens to reserve from the chunked-prefill budget for "
+            "warm waiting requests per step. Caps the throughput tax on the cold request.",
+        )
+        parser.add_argument(
+            "--prefill-warm-peek-k",
+            type=int,
+            default=ServerArgs.prefill_warm_peek_k,
+            help="How many of the top waiting-queue requests to examine when computing "
+            "the warm reserve. Keeps the per-step scan bounded.",
         )
         parser.add_argument(
             "--prefill-max-requests",
