@@ -106,11 +106,24 @@ source "$UV_VENV/bin/activate"
 [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
 [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
+# Isolate the flashinfer JIT cache per venv. The shared host-mounted
+# /root/.cache/flashinfer retains build.ninja files baked against whichever
+# Python install site compiled them first (e.g. /usr/local/lib/python3.10/
+# dist-packages). flashinfer reuses an existing build.ninja verbatim (see
+# JitSpec.build in flashinfer/jit/core.py: "if not self.is_ninja_generated:
+# self.write_ninja()"), so a cache written by the legacy system-Python path
+# fails ninja under the new venv path with "missing source" or "file not
+# found" on tvm_ffi/flashinfer headers. Scoping the JIT dir to the venv
+# means every job regenerates build.ninja against its own install site, and
+# the cache is naturally reclaimed by the venv cleanup step.
+export FLASHINFER_JIT_DIR="$UV_VENV/flashinfer_jit"
+
 # Propagate to subsequent workflow steps. GITHUB_ENV/GITHUB_PATH only
 # affect *later* steps, never the current one.
 if [ -n "${GITHUB_ENV:-}" ]; then
     echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
     echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
+    echo "FLASHINFER_JIT_DIR=$FLASHINFER_JIT_DIR" >> "$GITHUB_ENV"
 fi
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$UV_VENV/bin" >> "$GITHUB_PATH"
