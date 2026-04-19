@@ -54,10 +54,26 @@ fi
 SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
 if [ "$USE_VENV" = "1" ]; then
-    # Per-job unique path. Include $$ (shell PID) so concurrent/back-to-back jobs
-    # on the same runner never target the same directory even if GITHUB_JOB
-    # doesn't differentiate matrix partitions.
-    UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
+    # Stable path (no run/job id). Rationale: deep_gemm bakes the site-packages
+    # include path into nvcc flags, which then get MD5'd into the JIT cache key
+    # (DeepGEMM/csrc/jit/compiler.hpp: `-I{library_include_path}` is part of
+    # `flags` in the `{name}$${signature}$${flags}$${code}` signature). A
+    # per-job path would change every run, so the host-mounted cache at
+    # ~/.cache/deep_gemm/cache/ would accumulate unreachable entries. Holding
+    # the path constant lets cached kernels carry across runs.
+    #
+    # Freshness is guaranteed by wiping and recreating the dir at the start of
+    # each job — equivalent isolation to a per-job path, minus the cache churn.
+    # Assumes one job per runner container at a time (current SGLang CI); a
+    # second concurrent job here would have its `rm -rf` pull the venv out
+    # from under the first.
+    UV_VENV="/tmp/sglang-ci-venv"
+    rm -rf "$UV_VENV"
+    # `rm -rf` can exit 0 while leaving contents behind in edge cases (bind
+    # mounts, chattr +i, busy files on distributed fs). If the wipe is
+    # incomplete, `uv venv --seed` would layer onto stale files and the job
+    # would fail obscurely later. Assert cleanliness up front.
+    [ ! -e "$UV_VENV" ] || { echo "FATAL: $UV_VENV still exists after rm -rf"; ls -la "$UV_VENV" || true; exit 1; }
     # --seed installs pip/setuptools into the venv so bare `pip` calls in
     # cache_nvidia_wheels.sh and the human-eval setup resolve to the venv's
     # pip (rather than silently falling back to system Python).
@@ -391,15 +407,17 @@ mark_step_done "Download flashinfer artifacts"
 # Stabilize FlashInfer JIT cache paths
 # ------------------------------------------------------------------------------
 # FlashInfer JIT writes build.ninja with hardcoded -isystem paths pointing to the
-# venv's flashinfer/data/ and tvm_ffi/include/. With per-job venvs each job gets
-# a unique /tmp/sglang-ci-<run>-<job>-<pid>/ path, but the JIT cache is shared
-# on the host mount. When the next job's venv has a different path and the old one
-# is cleaned up, ninja fails because source files no longer exist at the cached path.
+# venv's flashinfer/data/ and tvm_ffi/include/. The venv itself is stable across
+# runs (/tmp/sglang-ci-venv), but two cases can still invalidate ninja paths:
+# - Legacy build.ninja files left over from the old per-job path scheme
+#   (/tmp/sglang-ci-<run>-<job>-<pid>) before this code ran on the runner.
+# - FlashInfer version bumps that rebuild $STABLE_FI_DIR (see Part 2 below),
+#   leaving ninja entries pointing into the previous stable tree.
 #
-# Fix (two parts):
-# 1. Clear only STALE cached_ops (build.ninja referencing non-existent venv paths).
-#    Do NOT clear all cached_ops — they contain compiled .so files that take 10-20 min
-#    to recompile. Only remove entries where the source paths no longer exist.
+# Two parts:
+# 1. Clear only STALE cached_ops (build.ninja referencing non-existent paths).
+#    Do NOT clear all cached_ops — they contain compiled .so files that take
+#    10-20 min to recompile. Only remove entries where source paths are gone.
 # 2. Copy source files to a stable host-mounted path and symlink each venv's
 #    copy there. build.ninja then references the stable path across all jobs.
 #
