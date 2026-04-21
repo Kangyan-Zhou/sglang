@@ -2677,12 +2677,20 @@ def has_hf_quant_config(model_path: str) -> bool:
     if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
         return True
 
+    import huggingface_hub
     from huggingface_hub import try_to_load_from_cache
 
     # Check if the model_path is a HuggingFace model ID and exists locally
     result = try_to_load_from_cache(model_path, "hf_quant_config.json")
     if isinstance(result, str):
         return True
+
+    # HfApi.file_exists ignores HF_HUB_OFFLINE and bills against the shared
+    # HF rate limit; under CI or offline mode, treat a cache miss as
+    # definitive (models that actually have hf_quant_config.json will have
+    # cached it; others would 404 anyway).
+    if huggingface_hub.constants.HF_HUB_OFFLINE or get_bool_env_var("SGLANG_IS_IN_CI"):
+        return False
 
     # Check if the model_path is a remote URL and exists on the HuggingFace Hub
     try:
