@@ -15,6 +15,11 @@ on:
         required: false
         type: number
         default: 14
+      image_repo:
+        description: "Docker Hub repo to clean up (e.g. lmsysorg/sglang-staging for testing)"
+        required: false
+        type: string
+        default: "lmsysorg/sglang"
   workflow_dispatch:
     inputs:
       tag_prefixes:
@@ -26,6 +31,11 @@ on:
         required: false
         type: number
         default: 14
+      image_repo:
+        description: "Docker Hub repo to clean up (e.g. lmsysorg/sglang-staging for testing)"
+        required: false
+        type: string
+        default: "lmsysorg/sglang"
 
 jobs:
   cleanup:
@@ -36,13 +46,14 @@ jobs:
         env:
           TAG_PREFIXES: ${{ inputs.tag_prefixes }}
           KEEP_COUNT: ${{ inputs.keep_count }}
+          IMAGE_REPO: ${{ inputs.image_repo }}
         run: |
           TOKEN=$(curl -s -H "Content-Type: application/json" \
             -X POST -d '{"username": "${{ secrets.DOCKERHUB_USERNAME }}", "password": "${{ secrets.DOCKERHUB_TOKEN }}"}' \
             https://hub.docker.com/v2/users/login/ | jq -r .token)
 
           TAGS_RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" \
-            "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
+            "https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags/?page_size=100")
 
           echo "${TAG_PREFIXES}" | jq -r '.[]' | while read -r PREFIX; do
             echo "--- Checking prefix: ${PREFIX} ---"
@@ -59,7 +70,7 @@ jobs:
               for tag in $TAGS_TO_DELETE; do
                 echo "Deleting tag: $tag"
                 curl -X DELETE -H "Authorization: JWT $TOKEN" \
-                  "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/$tag/"
+                  "https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags/$tag/"
               done
             else
               echo "Only $TAG_COUNT tags found, no cleanup needed"

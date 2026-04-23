@@ -13,6 +13,10 @@ on:
       version:
         description: "Version to build (without v prefix, e.g., 0.5.7)"
         required: true
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
 
 jobs:
   resolve-version:
@@ -42,6 +46,7 @@ jobs:
       docker_target: framework_final
       sgl_version: ${{ needs.resolve-version.outputs.version }}
       use_environment: prod
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
       tag_config: |
         [
           {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest"]},

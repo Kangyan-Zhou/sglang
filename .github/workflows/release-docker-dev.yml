@@ -11,6 +11,10 @@ on:
         description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
         required: false
         default: ""
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
   schedule:
     - cron: "0 0 * * *"
 
@@ -69,6 +73,7 @@ jobs:
       checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
       extra_build_args: ${{ needs.prepare.outputs.extra_build_args }}
       tag_config: ${{ needs.prepare.outputs.tag_config }}
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
 
   cleanup-nightly:
@@ -77,4 +82,5 @@ jobs:
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
       tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
