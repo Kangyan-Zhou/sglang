@@ -1520,6 +1520,27 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(call.parameters)
         self.assertEqual(params["city"], "San Francisco")
 
+    def test_detect_and_parse_bare_invoke_with_trailing_text(self):
+        """Bare invoke with trailing assistant text must not bleed into invoke content.
+
+        Realistic when the model emits a thought after a forced call.
+        """
+        text = (
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '<｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "I have queried the spot for you."
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_favorite_tourist_spot")
+        params = json.loads(call.parameters)
+        self.assertEqual(params, {"city": "San Francisco"})
+        self.assertNotIn("queried the spot", call.parameters)
+
     def test_detect_and_parse_multiple_bare_invokes_no_wrapper(self):
         """Multiple bare invoke blocks (no wrapper) must all parse."""
         text = (

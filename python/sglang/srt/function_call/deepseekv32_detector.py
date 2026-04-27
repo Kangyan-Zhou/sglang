@@ -173,26 +173,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        # Two valid shapes the model may produce:
-        #   1. With wrapper: <｜DSML｜function_calls>...<｜DSML｜invoke>...</｜DSML｜invoke>...</｜DSML｜function_calls>
-        #   2. Bare invoke blocks: <｜DSML｜invoke>...</｜DSML｜invoke>
-        # The bare form occurs when tool_choice="required"/named forces a
-        # structural_tag with at_least_one=True, which constrains the model to
-        # emit a structure_info match (just the invoke block) without the wrapper.
+        # The bare-invoke form (no <｜DSML｜function_calls> wrapper) occurs when
+        # tool_choice="required"/named installs a structural_tag with
+        # at_least_one=True, which constrains output to a single structure_info
+        # match — the invoke block alone.
         bot_idx = text.find(self.bot_token)
-        invoke_start = "<｜DSML｜invoke"
-        invoke_idx = text.find(invoke_start)
+        invoke_idx = text.find("<｜DSML｜invoke")
 
         if bot_idx == -1 and invoke_idx == -1:
             return StreamingParseResult(normal_text=text, calls=[])
 
-        # Use the earliest tool-call marker as the boundary for normal_text.
-        marker_indices = [i for i in (bot_idx, invoke_idx) if i != -1]
-        start_idx = min(marker_indices)
+        start_idx = min(i for i in (bot_idx, invoke_idx) if i != -1)
         normal_text = text[:start_idx].strip()
 
-        # Prefer the wrapper-bounded content if a complete wrapper is present;
-        # otherwise scan everything from the first marker onward for invoke blocks.
         function_calls_match = re.search(self.function_calls_regex, text, re.DOTALL)
         scan_text = (
             function_calls_match.group(1) if function_calls_match else text[start_idx:]
