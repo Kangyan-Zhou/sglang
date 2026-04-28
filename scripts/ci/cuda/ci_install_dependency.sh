@@ -370,11 +370,16 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
+        MOONCAKE_STALE_PKG="mooncake-transfer-engine"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
         MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
+        MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
+    # Both variants own the same mooncake/ package dir; remove any stale
+    # opposite-CUDA variant that an older PR run may have left on the runner.
+    $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
