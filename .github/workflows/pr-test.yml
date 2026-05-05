@@ -352,6 +352,167 @@ jobs:
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
+  # Phase-3 demo: build a Bazel test manifest from the dep graph + est_time
+  # tags, bin-packed into shards via tools/bin_pack_shards.py. Currently
+  # produces an artifact for inspection only — it does NOT yet drive any
+  # downstream job's matrix. Wiring shard jobs to consume this manifest
+  # is Phase-3.5 work that lands once parity with run_suite.py's
+  # auto_partition is verified.
+  compute-test-manifest:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (!failure() && !cancelled()) &&
+      needs.check-changes.outputs.main_package == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      # Exposed to downstream sharded jobs as a JSON blob keyed by suite
+      # name. Each value is a list of {id, targets, est_time} dicts that
+      # matrix-expand 1:1 into shard jobs.
+      shards: ${{ steps.bin-pack.outputs.shards }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+      - name: Install bazelisk
+        run: |
+          if ! bazel version >/dev/null 2>&1; then
+            arch=$(uname -m)
+            case "$arch" in
+              x86_64) suffix=amd64 ;;
+              aarch64|arm64) suffix=arm64 ;;
+              *) echo "unsupported arch: $arch"; exit 1 ;;
+            esac
+            tmp=$(mktemp)
+            curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v1.22.1/bazelisk-linux-${suffix}" \
+              -o "$tmp"
+            chmod +x "$tmp"
+            sudo mv "$tmp" /usr/local/bin/bazel
+          fi
+          bazel version | head -1
+      - name: Build manifest
+        id: bin-pack
+        run: |
+          # Belt-and-suspenders: GHA's bash default is `-eo pipefail`, but
+          # making this explicit means a future edit (wrapping in a
+          # function, splitting steps, etc.) can't silently lose the
+          # exit-on-error guard. A truncated cquery file with no `-e`
+          # would silently produce an empty manifest → zero CI tests.
+          set -euo pipefail
+          bazel cquery 'kind(py_test, //test/...)' --output=jsonproto > /tmp/targets.jsonproto
+          python3 tools/bin_pack_shards.py /tmp/targets.jsonproto \
+            --shards stage-b-test-1-gpu-small=8 \
+            > manifest.json
+          echo "=== manifest.json ===" && cat manifest.json
+          # Expose the JSON as a job output so downstream matrices can read
+          # it without an extra download-artifact step. jq -c to keep it
+          # single-line for the GHA output buffer (max 1MB; well under).
+          echo "shards=$(jq -c . manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-test-manifest
+          path: manifest.json
+          if-no-files-found: error
+
+  # Phase-3.5 demo: matrix-expand stage-b-test-1-gpu-small over the
+  # manifest's shards and run each via `bazel test $TARGETS`. Coexists
+  # with the existing stage-b-test-1-gpu-small job (which still runs
+  # run_suite.py partitioned + the partition-0 parallel-shipping bazel
+  # step from feat/bazel-pr-test-yml). Drop both predecessors once
+  # parity is verified for one or two release cycles.
+  #
+  # `continue-on-error: true` so a Bazel-only failure can never block
+  # the existing run_suite.py-driven shard jobs during shadow-running.
+  stage-b-test-1-gpu-small-bazel-sharded:
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels, compute-test-manifest]
+    if: |
+      always() &&
+      (!failure() && !cancelled()) &&
+      needs.check-changes.outputs.main_package == 'true' &&
+      needs.compute-test-manifest.outputs.shards != '' &&
+      fromJSON(needs.compute-test-manifest.outputs.shards)['stage-b-test-1-gpu-small'] != null
+    runs-on: 1-gpu-5090
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Mirror the predecessor stage-b-test-1-gpu-small job's runner cap
+      # so we don't starve the 1-gpu-5090 pool for other in-flight PRs.
+      # filtered runs cap at 3, full runs at 8 (matches max_parallel_small).
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_small) }}
+      matrix:
+        shard: ${{ fromJSON(needs.compute-test-manifest.outputs.shards)['stage-b-test-1-gpu-small'] }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Install bazelisk
+        run: |
+          # Matches the partition-0 install in the existing
+          # stage-b-test-1-gpu-small job — bare `mv` (no sudo). The
+          # 1-gpu-5090 self-hosted runners are configured with the
+          # runner user owning /usr/local/bin, so sudo would fail.
+          # The compute-test-manifest job uses `sudo mv` because it
+          # runs on ubuntu-latest (GitHub-hosted) where sudo is required.
+          # TODO once Phase-3.5 is stable: lift both variants into a
+          # composite action under .github/actions/setup-bazel/ that
+          # picks the right form based on the runner.
+          if ! bazel version >/dev/null 2>&1; then
+            arch=$(uname -m)
+            case "$arch" in
+              x86_64) suffix=amd64 ;;
+              aarch64|arm64) suffix=arm64 ;;
+              *) echo "unsupported arch: $arch"; exit 1 ;;
+            esac
+            tmp=$(mktemp)
+            curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v1.22.1/bazelisk-linux-${suffix}" \
+              -o "$tmp"
+            chmod +x "$tmp"
+            mv "$tmp" /usr/local/bin/bazel
+          fi
+          bazel version | head -1
+
+      - name: Run shard ${{ matrix.shard.id }} (est_time=${{ matrix.shard.est_time }}s)
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          # ${{ matrix.shard.targets }} is the space-separated list of
+          # target labels that bin_pack_shards.py packed into this shard.
+          bazel test ${{ matrix.shard.targets }} \
+            --test_output=errors \
+            --jobs=1 --local_test_jobs=1
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: bazel-shard-${{ matrix.shard.id }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+
   # These jobs poll GitHub API to wait for previous stages to complete.
   # For PR runs: wait jobs run and enforce sequential execution via polling.
   # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
