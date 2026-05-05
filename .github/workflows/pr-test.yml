@@ -352,6 +352,55 @@ jobs:
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
+  # Phase-3 demo: build a Bazel test manifest from the dep graph + est_time
+  # tags, bin-packed into shards via tools/bin_pack_shards.py. Currently
+  # produces an artifact for inspection only — it does NOT yet drive any
+  # downstream job's matrix. Wiring shard jobs to consume this manifest
+  # is Phase-3.5 work that lands once parity with run_suite.py's
+  # auto_partition is verified.
+  compute-test-manifest:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (!failure() && !cancelled()) &&
+      needs.check-changes.outputs.main_package == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+      - name: Install bazelisk
+        run: |
+          if ! bazel version >/dev/null 2>&1; then
+            arch=$(uname -m)
+            case "$arch" in
+              x86_64) suffix=amd64 ;;
+              aarch64|arm64) suffix=arm64 ;;
+              *) echo "unsupported arch: $arch"; exit 1 ;;
+            esac
+            tmp=$(mktemp)
+            curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v1.22.1/bazelisk-linux-${suffix}" \
+              -o "$tmp"
+            chmod +x "$tmp"
+            sudo mv "$tmp" /usr/local/bin/bazel
+          fi
+          bazel version | head -1
+      - name: Build manifest
+        run: |
+          bazel cquery 'kind(py_test, //test/...)' --output=jsonproto > /tmp/targets.jsonproto
+          python3 tools/bin_pack_shards.py /tmp/targets.jsonproto \
+            --shards stage-b-test-1-gpu-small=8 \
+            > manifest.json
+          echo "=== manifest.json ===" && cat manifest.json
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-test-manifest
+          path: manifest.json
+          if-no-files-found: error
+
   # These jobs poll GitHub API to wait for previous stages to complete.
   # For PR runs: wait jobs run and enforce sequential execution via polling.
   # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
