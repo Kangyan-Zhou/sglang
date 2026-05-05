@@ -389,6 +389,12 @@ jobs:
           bazel version | head -1
       - name: Build manifest
         run: |
+          # Belt-and-suspenders: GHA's bash default is `-eo pipefail`, but
+          # making this explicit means a future edit (wrapping in a
+          # function, splitting steps, etc.) can't silently lose the
+          # exit-on-error guard. A truncated cquery file with no `-e`
+          # would silently produce an empty manifest → zero CI tests.
+          set -euo pipefail
           bazel cquery 'kind(py_test, //test/...)' --output=jsonproto > /tmp/targets.jsonproto
           python3 tools/bin_pack_shards.py /tmp/targets.jsonproto \
             --shards stage-b-test-1-gpu-small=8 \

@@ -90,28 +90,68 @@ def _parse_shards_arg(arg: str) -> dict[str, int]:
     return out
 
 
-def _extract_targets(jsonproto_path: Path) -> list[_Target]:
+def _extract_targets(jsonproto_path: Path, errors: list[str]) -> list[_Target]:
     """Pull (label, suite, est_time) tuples from a `bazel cquery
-    --output=jsonproto` payload. Targets without both `sgl-suite-*` and
-    `est_time:*` tags are silently skipped (they're not part of any
-    runnable suite under our convention)."""
-    payload = json.loads(jsonproto_path.read_text())
+    --output=jsonproto` payload.
+
+    Failure modes we treat as hard errors (vs silent skip):
+    - Suite tag present but est_time missing or malformed. The target
+      would be reachable via `bazel test --test_tag_filters=sgl-suite-*`
+      but invisible to the manifest — the worst kind of "looks-wired,
+      isn't-wired" failure.
+    - The `tags` attribute exists but isn't `stringListValue`-shaped
+      (Bazel jsonproto schema change worth failing loudly on).
+    - Top-level payload is missing the `results` key (truncated cquery
+      output, error envelope, etc.).
+
+    Targets that lack a suite tag entirely are legitimately skipped —
+    they're not claimed by any CI run.
+    """
+    try:
+        raw = jsonproto_path.read_text()
+    except OSError as e:
+        sys.exit(f"ERROR: cannot read {jsonproto_path}: {e}")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(
+            f"ERROR: {jsonproto_path} is not valid JSON ({e}); "
+            f"size={len(raw)} bytes. Did `bazel cquery` fail mid-write?"
+        )
+
+    if "results" not in payload:
+        sys.exit(
+            f"ERROR: {jsonproto_path} has no 'results' key. Bazel jsonproto "
+            f'for zero matching targets is `{{"results": []}}`, never `{{}}`. '
+            f"Probable truncated cquery output; size={len(raw)} bytes."
+        )
+
     out: list[_Target] = []
-    for target in payload.get("results", []):
+    for target in payload["results"]:
         rule = target.get("target", {}).get("rule", {})
         label = rule.get("name", "")
         if not label:
             continue
         # rule.attribute is a list of attr dicts; tags live in the one
         # whose name == "tags". Bazel's jsonproto output uses
-        # string_list_value for repeated string attrs.
-        tags: list[str] = []
+        # `stringListValue` (camelCase) per protobuf-to-JSON canonical
+        # mapping for the `string_list_value` proto field.
+        tags: list[str] | None = None
         for attr in rule.get("attribute", []):
             if attr.get("name") == "tags":
-                tags = list(attr.get("stringListValue", []))
+                if "stringListValue" not in attr:
+                    errors.append(
+                        f"{label}: 'tags' attribute is not stringListValue-"
+                        f"shaped; Bazel jsonproto schema may have changed"
+                    )
+                    break
+                tags = list(attr["stringListValue"])
                 break
+        if tags is None:
+            continue  # no tags attr; legitimately not in any CI suite
+
         suite = ""
-        est_time = -1
+        est_time: int | None = None
         for tag in tags:
             if tag.startswith(_SUITE_TAG_PREFIX):
                 suite = tag[len(_SUITE_TAG_PREFIX) :]
@@ -119,9 +159,28 @@ def _extract_targets(jsonproto_path: Path) -> list[_Target]:
                 try:
                     est_time = int(tag[len(_EST_TIME_TAG_PREFIX) :])
                 except ValueError:
-                    sys.stderr.write(f"WARN: {label} has malformed {tag!r}; skipping\n")
-                    est_time = -1
-        if not suite or est_time < 0:
+                    errors.append(
+                        f"{label}: malformed {tag!r} (expected "
+                        f"{_EST_TIME_TAG_PREFIX}<int>)"
+                    )
+
+        if not suite:
+            # Legitimate skip: target isn't claimed by any CI suite.
+            continue
+        if est_time is None:
+            # Asymmetric with missing-suite: a test wearing a suite tag
+            # that has no est_time would silently disappear from the
+            # manifest while still appearing in `bazel query` results.
+            # Hard error — codegen is out of sync or the BUILD's tags
+            # were edited by hand.
+            errors.append(
+                f"{label}: has tag '{_SUITE_TAG_PREFIX}{suite}' but no "
+                f"'{_EST_TIME_TAG_PREFIX}N' tag — codegen out of sync? "
+                f"Re-run scripts/ci/generate_bazel_tags.py."
+            )
+            continue
+        if est_time < 0:
+            # Already errored above (malformed); skip without re-erroring.
             continue
         out.append(_Target(label=label, suite=suite, est_time=est_time))
     return out
@@ -150,15 +209,19 @@ def _build_manifest(
     for t in targets:
         by_suite.setdefault(t.suite, []).append(t)
 
-    # Suites with targets but no shard config are skipped with a stderr
-    # warning — caller controls which suites to emit shards for, and
+    # Suites with targets but no shard config are reported via GHA
+    # workflow annotations (on stderr — stdout is reserved for the JSON
+    # manifest). Caller controls which suites to emit shards for, and
     # not every suite the codebase declares maps to a runnable CI suite
-    # in this run. (E.g. nightlies on a per-commit run.)
+    # in this run (e.g. nightlies on a per-commit run). The `::warning::`
+    # syntax surfaces drift on the PR Checks page so a stale --shards
+    # arg doesn't silently lose a suite.
     for suite, items in by_suite.items():
         if suite not in shard_counts:
             sys.stderr.write(
-                f"INFO: suite {suite!r} has {len(items)} target(s) but no "
-                f"--shards entry; skipped (add to --shards to include)\n"
+                f"::warning title=Bazel manifest::"
+                f"suite {suite!r} has {len(items)} target(s) but no "
+                f"--shards entry; skipped\n"
             )
 
     # Configured shards with zero matching targets ARE an error — the
@@ -199,9 +262,9 @@ def main() -> int:
     args = p.parse_args()
 
     shard_counts = _parse_shards_arg(args.shards)
-    targets = _extract_targets(args.jsonproto)
 
     errors: list[str] = []
+    targets = _extract_targets(args.jsonproto, errors)
     manifest = _build_manifest(targets, shard_counts, errors)
 
     if errors:
