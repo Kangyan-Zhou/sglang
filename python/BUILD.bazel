@@ -1,0 +1,110 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Per-submodule py_libraries so test cache invalidation tracks the actual
+# directory of changed code, not "any .py under python/sglang/". Each
+# submodule depends on `:core` (so `import sglang` resolves) but NOT on
+# its siblings — that's deliberate. Tests list which submodules they need
+# via the `sglang_modules` macro arg; an editing of `lang/foo.py` then
+# only invalidates targets that listed `:lang` in their dep set.
+#
+# `:sglang_srcs` is the backward-compat aggregate that pulls everything in.
+# Tests that don't care about cache granularity (or aren't sure what they
+# need) can keep using it.
+
+# Top-level shim: sglang/__init__.py, version.py, utils.py, etc. Every
+# other submodule depends on this so `import sglang` works.
+py_library(
+    name = "core",
+    srcs = glob(
+        ["sglang/*.py"],
+        allow_empty = False,
+    ),
+    imports = ["."],
+)
+
+# Mirror python/pyproject.toml's [tool.setuptools.package-data]: srt and
+# jit_kernel ship non-Python assets (.cuh, .cu, include/, .json) located
+# at runtime via __file__-relative paths.
+py_library(
+    name = "srt",
+    srcs = glob(["sglang/srt/**/*.py"]),
+    data = glob(
+        ["sglang/srt/**/*"],
+        exclude = [
+            "sglang/**/*.py",
+            "sglang/**/__pycache__/**",
+            "sglang/**/*.pyc",
+        ],
+        allow_empty = True,
+    ),
+    imports = ["."],
+    deps = [":core"],
+)
+
+py_library(
+    name = "jit_kernel",
+    srcs = glob(["sglang/jit_kernel/**/*.py"]),
+    data = glob(
+        ["sglang/jit_kernel/**/*"],
+        exclude = [
+            "sglang/**/*.py",
+            "sglang/**/__pycache__/**",
+            "sglang/**/*.pyc",
+        ],
+        allow_empty = True,
+    ),
+    imports = ["."],
+    deps = [":core"],
+)
+
+py_library(
+    name = "lang",
+    srcs = glob(["sglang/lang/**/*.py"]),
+    imports = ["."],
+    deps = [":core"],
+)
+
+py_library(
+    name = "test_helpers",
+    srcs = glob(["sglang/test/**/*.py"]),
+    imports = ["."],
+    deps = [":core"],
+)
+
+py_library(
+    name = "multimodal_gen",
+    srcs = glob(["sglang/multimodal_gen/**/*.py"]),
+    imports = ["."],
+    deps = [":core"],
+)
+
+# Small/rarely-touched submodules collapsed together — splitting these
+# further wouldn't move the needle on cache hit rates.
+py_library(
+    name = "misc",
+    srcs = glob([
+        "sglang/cli/**/*.py",
+        "sglang/benchmark/**/*.py",
+        "sglang/eval/**/*.py",
+    ]),
+    imports = ["."],
+    deps = [":core"],
+)
+
+# Backward-compat aggregate. py_library with no srcs but full deps is the
+# Bazel idiom for "alias bundle" — consumers get the union of all sources
+# transitively, change to ANY of them invalidates ANY consumer.
+py_library(
+    name = "sglang_srcs",
+    deps = [
+        ":core",
+        ":jit_kernel",
+        ":lang",
+        ":misc",
+        ":multimodal_gen",
+        ":srt",
+        ":test_helpers",
+    ],
+)

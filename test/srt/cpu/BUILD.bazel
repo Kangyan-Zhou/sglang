@@ -1,0 +1,35 @@
+load("//tools:pytest.bzl", "pytest_dir", "pytest_test")
+
+# Per-file targets generated for everything matching test_*.py in this dir.
+# `bazel test //test/srt/cpu:all_tests` to run them all.
+# `bazel test //test/srt/cpu:test_activation` for a single file.
+pytest_dir(
+    name = "all_tests",
+    size = "medium",
+    tags = ["cpu"],
+    venv_deps = ["torch", "numpy"],
+    exclude = [
+        "test_decode.py",
+        "test_extend.py",
+    ],
+)
+
+# Heavier tests get explicit configuration: larger size, longer timeout,
+# optional sharding, extra deps.
+pytest_test(
+    name = "test_decode",
+    src = "test_decode.py",
+    size = "large",
+    tags = ["cpu"],
+    timeout = "long",
+    venv_deps = ["torch", "numpy", "flashinfer"],
+)
+
+pytest_test(
+    name = "test_extend",
+    src = "test_extend.py",
+    size = "large",
+    tags = ["cpu"],
+    timeout = "long",
+    venv_deps = ["torch", "numpy"],
+)

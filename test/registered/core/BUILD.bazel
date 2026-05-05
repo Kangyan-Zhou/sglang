@@ -1,0 +1,19 @@
+load("//tools:pytest.bzl", "pytest_dir")
+
+# Notice the mix of dep sources — `torch` and `flashinfer` come from
+# python/pyproject.toml; `deep_ep` is built from source by
+# scripts/ci/cuda/ci_install_deepep.sh; `sgl_kernel` is force-installed
+# from a CUDA-matched index by ci_install_dependency.sh. Bazel doesn't
+# care — venv_deps just asserts they're importable.
+pytest_dir(
+    name = "all_tests",
+    size = "large",
+    tags = ["registered", "gpu"],
+    timeout = "long",
+    venv_deps = [
+        "torch",
+        "sgl_kernel",
+        "flashinfer",
+        "deep_ep",
+    ],
+)

@@ -1,0 +1,20 @@
+common --enable_bzlmod
+
+build --incompatible_strict_action_env
+
+test --test_output=errors
+test --test_summary=terse
+test --test_verbose_timeout_warnings
+
+# Surface PATH/HOME so `python3` and venvs work without extra wiring.
+test --action_env=PATH
+test --action_env=HOME
+test --test_env=PATH
+test --test_env=HOME
+test --test_env=VIRTUAL_ENV
+test --test_env=PYTHONUSERBASE
+
+# CI-friendly defaults; override locally with --config=local.
+build:ci --color=no
+build:ci --show_timestamps
+test:ci --test_output=all

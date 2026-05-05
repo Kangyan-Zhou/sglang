@@ -1,0 +1,21 @@
+load("//tools:pytest.bzl", "SGLANG_RUNTIME", "pytest_test")
+
+# Quant kernel tests scope to SGLANG_RUNTIME — they don't touch sglang.lang
+# or sglang.multimodal_gen, so changes to those shouldn't bust this cache.
+pytest_test(
+    name = "test_triton_scaled_mm",
+    src = "test_triton_scaled_mm.py",
+    size = "small",
+    tags = ["gpu", "1-gpu"],
+    venv_deps = ["torch", "triton"],
+    sglang_modules = SGLANG_RUNTIME,
+)
+
+pytest_test(
+    name = "test_int8_kernel",
+    src = "test_int8_kernel.py",
+    size = "medium",
+    tags = ["gpu", "1-gpu"],
+    venv_deps = ["torch", "triton"],
+    sglang_modules = SGLANG_RUNTIME,
+)

@@ -1,0 +1,147 @@
+"""Macros that wrap pytest test files as Bazel py_test targets.
+
+Bazel manages no Python deps directly. Every import a test needs comes from
+the active venv, which CI populates via:
+
+  * `uv pip install -e python[dev,runai,tracing]` from python/pyproject.toml
+  * side scripts under scripts/ci/cuda/ (ci_install_deepep.sh, etc.) for
+    things that aren't in pyproject (deep_ep, gdrcopy, libfabric, ...).
+
+`venv_deps` is the import-time dep declaration: list the import names a test
+needs. tools/pytest_main.py checks them at startup and exits with a clear
+error if any are missing.
+
+`sglang_modules` controls which slice of the in-tree sglang source tree the
+test depends on for cache-invalidation purposes. The default is the full
+aggregate (`//python:sglang_srcs`); pass a narrower list (e.g.
+`SGLANG_RUNTIME`) to scope cache invalidation to only the submodules used.
+The submodule taxonomy is defined in tools/sglang_modules.bzl and drives
+the runtime import audit hook (which fails any test that imports a sglang
+submodule outside its declared scope).
+"""
+
+load("@rules_python//python:defs.bzl", "py_test")
+load(
+    ":sglang_modules.bzl",
+    "ALL_SUBMODULE_DIRS",
+    "LABEL_TO_DIRS",
+    _SGLANG_RUNTIME = "SGLANG_RUNTIME",
+)
+
+# Re-export so test BUILDs can keep using
+# `load("//tools:pytest.bzl", "SGLANG_RUNTIME", "pytest_test")`.
+SGLANG_RUNTIME = _SGLANG_RUNTIME
+
+# Default: aggregate. Backward-compatible with pre-Rung-1.5 BUILD files.
+_DEFAULT_SGLANG_MODULES = ["//python:sglang_srcs"]
+
+def _compute_declared_dirs(sglang_modules):
+    """Resolve a list of //python:* labels to sglang.X directory names.
+
+    Fails loudly at BUILD evaluation if a label isn't in LABEL_TO_DIRS —
+    that's a typo or a missing entry in tools/sglang_modules.bzl, never
+    something the runtime audit should silently skip past.
+    """
+    dirs = []
+    for label in sglang_modules:
+        name = label.rsplit(":", 1)[-1]
+        if name not in LABEL_TO_DIRS:
+            fail(
+                "Unknown sglang_module label '{}' (target name '{}'). ".format(label, name) +
+                "Add it to tools/sglang_modules.bzl#LABEL_TO_DIRS so the import audit knows about it.",
+            )
+        dirs.extend(LABEL_TO_DIRS[name])
+    return dirs
+
+def pytest_test(
+        name,
+        src,
+        venv_deps = [],
+        sglang_modules = None,
+        helper_srcs = None,
+        extra_args = None,
+        **kwargs):
+    """One pytest invocation, exposed as a Bazel py_test target.
+
+    Args:
+      name: target name.
+      src: the test file (relative path within the package).
+      venv_deps: import names that must exist in the active venv.
+      sglang_modules: list of //python:* targets to depend on. Defaults
+        to the full aggregate; pass a narrower list (e.g. SGLANG_RUNTIME)
+        to scope cache invalidation to only the submodules used.
+      helper_srcs: sibling .py files imported by the test. `None`
+        auto-globs `*.py` excluding files that match `test_*.py`. Pass
+        `[]` to disable; pass an explicit list to override the auto-glob
+        (e.g. when a helper is named `test_helpers.py`).
+      extra_args: extra argv forwarded to pytest, e.g. ["-k", "smoke"].
+      **kwargs: passed to py_test (size, tags, timeout, shard_count, ...).
+    """
+    args = ["$(rootpath {})".format(src)]
+    if extra_args:
+        args = args + extra_args
+
+    deps = sglang_modules if sglang_modules != None else _DEFAULT_SGLANG_MODULES
+    declared = _compute_declared_dirs(deps)
+
+    env = dict(kwargs.pop("env", {}))
+    if venv_deps:
+        env["SGLANG_REQUIRED_VENV_DEPS"] = ",".join(venv_deps)
+    env["SGLANG_DECLARED_DIRS"] = ",".join(declared)
+    env["SGLANG_KNOWN_SUBDIRS"] = ",".join(ALL_SUBMODULE_DIRS)
+
+    # Auto-detect sibling helpers when not explicitly provided. Excludes
+    # other test_*.py files (each test owns its own; sharing is via helper
+    # files like utils.py). Pass helper_srcs = [] to opt out, or an
+    # explicit list to override.
+    if helper_srcs == None:
+        all_py = native.glob(["*.py"], allow_empty = True)
+        helper_srcs = [f for f in all_py if not f.startswith("test_")]
+
+    py_test(
+        name = name,
+        srcs = ["//tools:pytest_main.py", src] + helper_srcs,
+        main = "//tools:pytest_main.py",
+        args = args,
+        deps = deps,
+        env = env,
+        # Put the test's own package dir on PYTHONPATH so siblings like
+        # `utils.py` resolve as `from utils import ...`.
+        imports = ["."],
+        **kwargs
+    )
+
+def pytest_dir(
+        name = "all_tests",
+        glob_pattern = "test_*.py",
+        exclude = [],
+        venv_deps = [],
+        sglang_modules = None,
+        size = "medium",
+        tags = None,
+        **kwargs):
+    """Generate one pytest_test per matching file, plus an `all_tests` test_suite."""
+    test_files = native.glob([glob_pattern], exclude = exclude, allow_empty = True)
+    helper_srcs = native.glob(
+        ["*.py"],
+        exclude = test_files + exclude,
+        allow_empty = True,
+    )
+    test_targets = []
+    for src in test_files:
+        target_name = src[:-len(".py")]
+        pytest_test(
+            name = target_name,
+            src = src,
+            venv_deps = venv_deps,
+            sglang_modules = sglang_modules,
+            helper_srcs = helper_srcs,
+            size = size,
+            tags = tags,
+            **kwargs
+        )
+        test_targets.append(":" + target_name)
+    native.test_suite(
+        name = name,
+        tests = test_targets,
+    )

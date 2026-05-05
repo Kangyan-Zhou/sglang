@@ -1,0 +1,23 @@
+"""Bazel module for sglang.
+
+Pure Rung-1 layout: Bazel manages NO Python dependencies. The CI install
+script (scripts/ci/cuda/ci_install_dependency.sh + side scripts like
+ci_install_deepep.sh) populates the active venv via `uv pip install -e
+python[dev,...]` plus out-of-band installs (deep_ep built from source,
+flashinfer JIT cache, sgl-kernel from a CUDA-matched index, etc.).
+
+Bazel just runs pytest. The runtime_env Python toolchain routes test
+launches through `python3` from PATH, so whatever the venv has — whether
+it came from pyproject.toml or a CI shell script — is what tests see.
+"""
+
+module(
+    name = "sglang",
+    version = "0.0.0-dev",
+)
+
+bazel_dep(name = "rules_python", version = "1.7.0")
+
+# Use the host's `python3`. CI activates the venv before invoking bazel,
+# so `import torch`, `import deep_ep`, etc. all resolve from the venv.
+register_toolchains("@rules_python//python/runtime_env_toolchains:all")

@@ -1,0 +1,13 @@
+load("//tools:pytest.bzl", "SGLANG_RUNTIME", "pytest_test")
+
+# Demo of Rung 1.5 narrow scope: this test only depends on srt + jit_kernel
+# + test_helpers + core. Edits to python/sglang/lang/, multimodal_gen/, etc.
+# do NOT invalidate this test's cache.
+pytest_test(
+    name = "test_create_kvindices",
+    src = "test_create_kvindices.py",
+    size = "small",
+    tags = ["gpu", "1-gpu"],
+    venv_deps = ["torch", "numpy", "triton"],
+    sglang_modules = SGLANG_RUNTIME,
+)
