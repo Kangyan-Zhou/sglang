@@ -93,6 +93,12 @@ repos:
         language: system
         files: ^test/registered/.*\.py$
         pass_filenames: false
+      - id: check-bazel-test-registry
+        name: check Bazel test registry is up to date
+        entry: python3 scripts/ci/generate_bazel_tags.py --check
+        language: system
+        files: ^(test/(registered|srt|manual)/.*\.py|scripts/ci/generate_bazel_tags\.py|tools/sglang_test_registry\.bzl)$
+        pass_filenames: false
       - id: check-no-docs-changes
         name: reject changes under legacy docs/
         entry: python3 scripts/ci/check_no_docs_changes.py

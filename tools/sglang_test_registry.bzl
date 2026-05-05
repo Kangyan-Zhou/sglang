@@ -1600,6 +1600,11 @@ SGLANG_TEST_REGISTRY = {
         "est_time": 7200,
         "nightly": True,
     },
+    "test/registered/function_call/test_kimik2_detector.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 5,
+        "nightly": False,
+    },
     "test/registered/gb300/test_deepseek_v32.py": {
         "suite": "nightly-4-gpu-gb300",
         "est_time": 7200,
@@ -2670,6 +2675,26 @@ SGLANG_TEST_REGISTRY = {
         "est_time": 7,
         "nightly": False,
     },
+    "test/registered/unit/constrained/test_base_grammar_backend.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 2,
+        "nightly": False,
+    },
+    "test/registered/unit/constrained/test_grammar_manager.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 2,
+        "nightly": False,
+    },
+    "test/registered/unit/constrained/test_reasoner_grammar_backend.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 2,
+        "nightly": False,
+    },
+    "test/registered/unit/constrained/test_utils.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 1,
+        "nightly": False,
+    },
     "test/registered/unit/entrypoints/openai/test_matched_stop.py": {
         "suite": "stage-a-test-cpu",
         "est_time": 6,
@@ -2725,9 +2750,44 @@ SGLANG_TEST_REGISTRY = {
         "est_time": 7,
         "nightly": False,
     },
+    "test/registered/unit/function_call/test_function_call_parser.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 15,
+        "nightly": False,
+    },
+    "test/registered/unit/function_call/test_hermes_detector.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 1,
+        "nightly": False,
+    },
     "test/registered/unit/function_call/test_hunyuan_detector.py": {
         "suite": "stage-a-test-cpu",
         "est_time": 7,
+        "nightly": False,
+    },
+    "test/registered/unit/function_call/test_json_schema_constraint.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 5,
+        "nightly": False,
+    },
+    "test/registered/unit/function_call/test_llama32_detector.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 1,
+        "nightly": False,
+    },
+    "test/registered/unit/function_call/test_mistral_detector.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 1,
+        "nightly": False,
+    },
+    "test/registered/unit/function_call/test_parallel_tool_calls.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 5,
+        "nightly": False,
+    },
+    "test/registered/unit/function_call/test_unknown_tool_name.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 5,
         "nightly": False,
     },
     "test/registered/unit/layers/quantization/test_fp4_kv_cache_quant_method.py": {
@@ -3028,6 +3088,11 @@ SGLANG_TEST_REGISTRY = {
     "test/registered/unit/tools/test_get_version_tag.py": {
         "suite": "stage-a-test-cpu",
         "est_time": 0,
+        "nightly": False,
+    },
+    "test/registered/unit/utils/test_auth.py": {
+        "suite": "stage-a-test-cpu",
+        "est_time": 1,
         "nightly": False,
     },
     "test/registered/unit/utils/test_gauge_histogram.py": {
