@@ -438,6 +438,10 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # Mirror the predecessor stage-b-test-1-gpu-small job's runner cap
+      # so we don't starve the 1-gpu-5090 pool for other in-flight PRs.
+      # filtered runs cap at 3, full runs at 8 (matches max_parallel_small).
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_small) }}
       matrix:
         shard: ${{ fromJSON(needs.compute-test-manifest.outputs.shards)['stage-b-test-1-gpu-small'] }}
     steps:
@@ -465,8 +469,15 @@ jobs:
 
       - name: Install bazelisk
         run: |
-          # Same logic as compute-test-manifest. TODO once Phase-3.5 is
-          # stable: lift into a composite action under .github/actions/.
+          # Matches the partition-0 install in the existing
+          # stage-b-test-1-gpu-small job — bare `mv` (no sudo). The
+          # 1-gpu-5090 self-hosted runners are configured with the
+          # runner user owning /usr/local/bin, so sudo would fail.
+          # The compute-test-manifest job uses `sudo mv` because it
+          # runs on ubuntu-latest (GitHub-hosted) where sudo is required.
+          # TODO once Phase-3.5 is stable: lift both variants into a
+          # composite action under .github/actions/setup-bazel/ that
+          # picks the right form based on the runner.
           if ! bazel version >/dev/null 2>&1; then
             arch=$(uname -m)
             case "$arch" in
@@ -478,7 +489,7 @@ jobs:
             curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v1.22.1/bazelisk-linux-${suffix}" \
               -o "$tmp"
             chmod +x "$tmp"
-            sudo mv "$tmp" /usr/local/bin/bazel
+            mv "$tmp" /usr/local/bin/bazel
           fi
           bazel version | head -1
 
