@@ -808,6 +808,53 @@ jobs:
           cd test/
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
+      # Phase-1 parallel-shipping: run the full suite via `bazel test` on
+      # partition 0 only, alongside the run_suite.py invocations on every
+      # partition. continue-on-error so this never fails the existing job
+      # while we're verifying parity. Drop the matrix gate + continue-on-error
+      # once we trust this path.
+      - name: Install bazelisk
+        if: matrix.partition == 0
+        run: |
+          # Gate on `bazel version` succeeding, not just `command -v`, so
+          # a half-written binary from a prior aborted job (the runner is
+          # self-hosted with shared /usr/local/bin) gets re-downloaded.
+          if ! bazel version >/dev/null 2>&1; then
+            arch=$(uname -m)
+            case "$arch" in
+              x86_64) suffix=amd64 ;;
+              aarch64|arm64) suffix=arm64 ;;
+              *) echo "unsupported arch: $arch"; exit 1 ;;
+            esac
+            tmp=$(mktemp)
+            curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v1.22.1/bazelisk-linux-${suffix}" \
+              -o "$tmp"
+            chmod +x "$tmp"
+            mv "$tmp" /usr/local/bin/bazel
+          fi
+          bazel version | head -1
+
+      - name: Run test (Bazel, parallel-shipping verification)
+        if: matrix.partition == 0
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          bazel test //test/... \
+            --test_tag_filters=sgl-suite-stage-b-test-1-gpu-small \
+            --test_output=errors \
+            --jobs=1 --local_test_jobs=1
+
+      # Capture coredumps from the Bazel run separately. continue-on-error
+      # on the Bazel step means the job-level `if: failure()` upload below
+      # never fires for a Bazel-only failure, and even if it did, both
+      # uploads would share artifact-suffix `0` and clobber. always() +
+      # distinct suffix gives us a deterministic place to find Bazel-side
+      # dumps during the parallel-shipping window.
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: matrix.partition == 0 && always()
+        with:
+          artifact-suffix: ${{ matrix.partition }}-bazel
+
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
