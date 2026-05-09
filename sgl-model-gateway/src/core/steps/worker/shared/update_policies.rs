@@ -143,6 +143,25 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             }
         }
 
+        // Initialize cache-aware policies for PD mode (prefill and decode).
+        // The PD router stores its policy in `prefill_policy`/`decode_policy`
+        // (separate from per-model registry policies). Without this seeding,
+        // a PD-mode gateway configured with cache_aware (mesh OR zmq) as the
+        // prefill/decode policy would never get workers wired into the
+        // policy — `init_cache_aware_policy` only covers the per-model path.
+        let decode_workers = app_context.worker_registry.get_decode_workers();
+        if !prefill_workers.is_empty() || !decode_workers.is_empty() {
+            let prefill_policy = app_context.policy_registry.get_prefill_policy();
+            let decode_policy = app_context.policy_registry.get_decode_policy();
+            let is_ca = |name: &str| name == "cache_aware" || name == "cache_aware_zmq";
+            if is_ca(prefill_policy.name()) || is_ca(decode_policy.name()) {
+                app_context
+                    .policy_registry
+                    .init_pd_cache_aware_policies(&prefill_workers, &decode_workers)
+                    .await;
+            }
+        }
+
         debug!(
             "Updated policies for {} workers across {} models",
             workers.len(),

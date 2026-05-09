@@ -50,7 +50,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::kv_events::{
     compute_block_hashes,
@@ -173,6 +173,14 @@ impl CacheAwareZmqPolicy {
             .build()
             .expect("reqwest::Client should build with default config");
 
+        info!(
+            sync_mode = "zmq",
+            event_port = config.event_port,
+            block_size = config.block_size,
+            event_channel_capacity = config.event_channel_capacity,
+            "cache-aware ZMQ indexer policy initialized; awaiting worker subscriptions"
+        );
+
         Self {
             config,
             trees,
@@ -281,6 +289,20 @@ impl CacheAwareZmqPolicy {
                 model_key: new_model_key,
                 dp_size: recorded_dp_size,
             },
+        );
+
+        // Log the resolved ZMQ endpoints at debug — operators can grep this
+        // during onboarding to confirm the gateway is connecting to the
+        // ports they expect. info! would be too noisy on a fleet with many
+        // workers.
+        let endpoints: Vec<String> = (0..event_cfg.dp_size)
+            .map(|r| format!("tcp://{}:{}", event_cfg.host, event_cfg.port_base as u32 + r))
+            .collect();
+        debug!(
+            worker_url = %url,
+            dp_size = event_cfg.dp_size,
+            endpoints = ?endpoints,
+            "cache-aware-zmq adding worker subscriptions"
         );
 
         self.subscribers.add_worker(&url, &event_cfg).await;
@@ -417,6 +439,23 @@ impl CacheAwareZmqPolicy {
     #[cfg(test)]
     pub(crate) fn apply_worker_event_for_test(&self, ev: WorkerEvent) {
         self.apply_event(ev);
+    }
+
+    /// Test inspection: total node count across all per-model trees.
+    /// Exposed for integration tests in `tests/routing/` that need to
+    /// observe the indexer's state to assert that ordered events landed
+    /// in the tree. Production code should not depend on this.
+    #[doc(hidden)]
+    pub fn total_node_count_for_test(&self) -> usize {
+        self.trees.iter().map(|e| e.value().node_count()).sum()
+    }
+
+    /// Test inspection: node count for one model's tree, or `None` if
+    /// the tree has not been created yet (no events applied, no worker
+    /// added).
+    #[doc(hidden)]
+    pub fn node_count_for_model_test(&self, model_id: &str) -> Option<usize> {
+        self.tree_for_model(model_id).map(|t| t.node_count())
     }
 }
 

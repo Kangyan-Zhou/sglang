@@ -78,21 +78,179 @@ pub struct BlockRemoved {
     pub medium: Option<String>,
 }
 
+/// Maximum number of block hashes a single decoded `BlockStored` /
+/// `BlockRemoved` event may carry. A misbehaving worker (or a corrupted
+/// frame) could otherwise prompt a multi-gigabyte allocation in the
+/// gateway. Workers are inside the trust boundary, so this is
+/// defense-in-depth — but the cost of *not* capping is unbounded memory
+/// amplification, so we cap.
+pub(crate) const MAX_HASHES_PER_EVENT: usize = 65_536;
+/// Same rationale as [`MAX_HASHES_PER_EVENT`], but for `token_ids`. A
+/// 1M-token block list is already absurdly larger than any realistic
+/// `BlockStored` payload — the cap exists to bound the worst case, not
+/// to constrain normal operation.
+pub(crate) const MAX_TOKENS_PER_EVENT: usize = 1_048_576;
+
 /// Errors produced by [`decode_event_batch`].
 #[derive(thiserror::Error, Debug)]
 pub enum DecodeError {
     /// The msgpack payload was malformed or did not match the expected schema.
     #[error("failed to decode KV event batch: {0}")]
     Msgpack(#[from] rmp_serde::decode::Error),
+    /// A single event's variable-length field exceeded its hard cap. We
+    /// surface this as an error rather than panicking so a single bad
+    /// payload only kills its batch, not the consumer task.
+    #[error("KV event field {field} length {len} exceeds cap {cap}")]
+    PayloadTooLarge {
+        field: &'static str,
+        len: usize,
+        cap: usize,
+    },
 }
+
+/// Sentinel string a custom visitor uses to encode a "field too large"
+/// error through serde's `de::Error::custom` channel. We rewrap as the
+/// typed [`DecodeError::PayloadTooLarge`] in [`decode_event_batch`].
+const PAYLOAD_TOO_LARGE_TAG: &str = "kv_events::wire::PAYLOAD_TOO_LARGE";
 
 /// Decode a single ZMQ payload frame from SGLang's `ZmqEventPublisher`.
 ///
 /// The payload is the `payload` arg to `_pub.send_multipart((topic, seq,
 /// payload))` — the topic and 8-byte big-endian sequence number are separate
 /// frames and are NOT part of the msgpack input here.
+///
+/// Caps the per-event `block_hashes` and `token_ids` lengths
+/// ([`MAX_HASHES_PER_EVENT`], [`MAX_TOKENS_PER_EVENT`]) so a misbehaving
+/// worker — or a corrupted msgpack length prefix — cannot trigger an
+/// unbounded allocation in the gateway.
 pub fn decode_event_batch(bytes: &[u8]) -> Result<KvEventBatch, DecodeError> {
-    Ok(rmp_serde::from_slice::<KvEventBatch>(bytes)?)
+    match rmp_serde::from_slice::<KvEventBatch>(bytes) {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            // Rewrap the size-cap sentinel into the typed variant. The
+            // sentinel string is set by `BoundedI64Vec` / `BoundedU32Vec`
+            // below; everything else is a true msgpack decode failure.
+            let s = e.to_string();
+            if let Some(rest) = s.strip_prefix(PAYLOAD_TOO_LARGE_TAG) {
+                // Format: "<TAG>:<field>:<len>:<cap>"
+                let mut parts = rest.trim_start_matches(':').split(':');
+                if let (Some(field), Some(len), Some(cap)) =
+                    (parts.next(), parts.next(), parts.next())
+                {
+                    if let (Ok(len), Ok(cap)) =
+                        (len.parse::<usize>(), cap.parse::<usize>())
+                    {
+                        let field = match field {
+                            "block_hashes" => "block_hashes",
+                            "token_ids" => "token_ids",
+                            // Unknown — fall through to Msgpack.
+                            _ => return Err(DecodeError::Msgpack(e)),
+                        };
+                        return Err(DecodeError::PayloadTooLarge { field, len, cap });
+                    }
+                }
+            }
+            Err(DecodeError::Msgpack(e))
+        }
+    }
+}
+
+/// Newtype wrapping `Vec<i64>` whose `Deserialize` impl rejects sequences
+/// announcing more than [`MAX_HASHES_PER_EVENT`] elements *before* doing
+/// the per-element work. Required because `rmp-serde` pre-sizes the
+/// destination `Vec` from the msgpack length prefix; a malicious or
+/// corrupted prefix would otherwise prompt a multi-gigabyte allocation.
+#[derive(Debug, Clone, PartialEq)]
+struct BoundedI64Vec(Vec<i64>);
+
+impl<'de> Deserialize<'de> for BoundedI64Vec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<i64>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a msgpack array of i64 values")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<i64>, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if let Some(hint) = seq.size_hint() {
+                    if hint > MAX_HASHES_PER_EVENT {
+                        return Err(de::Error::custom(format!(
+                            "{PAYLOAD_TOO_LARGE_TAG}:block_hashes:{hint}:{MAX_HASHES_PER_EVENT}"
+                        )));
+                    }
+                }
+                let mut out: Vec<i64> = match seq.size_hint() {
+                    Some(h) => Vec::with_capacity(h),
+                    None => Vec::new(),
+                };
+                while let Some(v) = seq.next_element::<i64>()? {
+                    if out.len() >= MAX_HASHES_PER_EVENT {
+                        return Err(de::Error::custom(format!(
+                            "{PAYLOAD_TOO_LARGE_TAG}:block_hashes:{}:{MAX_HASHES_PER_EVENT}",
+                            out.len() + 1
+                        )));
+                    }
+                    out.push(v);
+                }
+                Ok(out)
+            }
+        }
+        let v = deserializer.deserialize_seq(V)?;
+        Ok(BoundedI64Vec(v))
+    }
+}
+
+/// `BoundedI64Vec`'s `u32` twin. Same shape, different cap.
+#[derive(Debug, Clone, PartialEq)]
+struct BoundedU32Vec(Vec<u32>);
+
+impl<'de> Deserialize<'de> for BoundedU32Vec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u32>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a msgpack array of u32 values")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<u32>, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if let Some(hint) = seq.size_hint() {
+                    if hint > MAX_TOKENS_PER_EVENT {
+                        return Err(de::Error::custom(format!(
+                            "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{hint}:{MAX_TOKENS_PER_EVENT}"
+                        )));
+                    }
+                }
+                let mut out: Vec<u32> = match seq.size_hint() {
+                    Some(h) => Vec::with_capacity(h),
+                    None => Vec::new(),
+                };
+                while let Some(v) = seq.next_element::<u32>()? {
+                    if out.len() >= MAX_TOKENS_PER_EVENT {
+                        return Err(de::Error::custom(format!(
+                            "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{}:{MAX_TOKENS_PER_EVENT}",
+                            out.len() + 1
+                        )));
+                    }
+                    out.push(v);
+                }
+                Ok(out)
+            }
+        }
+        let v = deserializer.deserialize_seq(V)?;
+        Ok(BoundedU32Vec(v))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,11 +325,11 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
 
                 match tag.as_str() {
                     "BlockStored" => {
-                        let block_hashes: Vec<i64> = seq
+                        let block_hashes: BoundedI64Vec = seq
                             .next_element()?
                             .ok_or_else(|| de::Error::missing_field("block_hashes"))?;
                         let parent_block_hash: Option<i64> = seq.next_element()?.unwrap_or(None);
-                        let token_ids: Vec<u32> = seq
+                        let token_ids: BoundedU32Vec = seq
                             .next_element()?
                             .ok_or_else(|| de::Error::missing_field("token_ids"))?;
                         let block_size: u32 = seq
@@ -184,22 +342,22 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         let medium: Option<String> = seq.next_element()?.unwrap_or(None);
                         while seq.next_element::<IgnoredAny>()?.is_some() {}
                         Ok(KvCacheEvent::BlockStored(BlockStored {
-                            block_hashes,
+                            block_hashes: block_hashes.0,
                             parent_block_hash,
-                            token_ids,
+                            token_ids: token_ids.0,
                             block_size,
                             lora_id,
                             medium,
                         }))
                     }
                     "BlockRemoved" => {
-                        let block_hashes: Vec<i64> = seq
+                        let block_hashes: BoundedI64Vec = seq
                             .next_element()?
                             .ok_or_else(|| de::Error::missing_field("block_hashes"))?;
                         let medium: Option<String> = seq.next_element()?.unwrap_or(None);
                         while seq.next_element::<IgnoredAny>()?.is_some() {}
                         Ok(KvCacheEvent::BlockRemoved(BlockRemoved {
-                            block_hashes,
+                            block_hashes: block_hashes.0,
                             medium,
                         }))
                     }
@@ -610,5 +768,92 @@ mod tests {
         let err = decode_event_batch(&[]).expect_err("empty payload should fail");
         // Just assert we surfaced a Msgpack decode error.
         assert!(matches!(err, DecodeError::Msgpack(_)));
+    }
+
+    /// A `BlockStored` event whose `block_hashes` array prefix exceeds
+    /// the per-event cap must be rejected with `PayloadTooLarge` so a
+    /// misbehaving worker (or a corrupted msgpack length prefix) cannot
+    /// trigger an unbounded allocation in the gateway. We don't fill the
+    /// whole array — the visitor refuses on the size_hint alone.
+    #[test]
+    fn block_stored_with_too_many_hashes_rejected() {
+        let claimed = (MAX_HASHES_PER_EVENT + 1) as u32;
+
+        let mut event = Vec::new();
+        write_event_array(&mut event, "BlockStored", 7);
+        // Oversize block_hashes prefix; only one real element. The
+        // visitor's size_hint check fires before reading anything.
+        mp::write_array_len(&mut event, claimed).unwrap();
+        mp::write_sint(&mut event, 0).unwrap();
+        // Trailing bytes are ignored — decoder errors out earlier.
+
+        let bytes = build_batch_bytes(0.0, &[event], None, true);
+
+        let err = decode_event_batch(&bytes).expect_err("oversize hashes should fail");
+        match err {
+            DecodeError::PayloadTooLarge { field, len, cap } => {
+                assert_eq!(field, "block_hashes");
+                assert_eq!(cap, MAX_HASHES_PER_EVENT);
+                assert_eq!(len, claimed as usize);
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+    }
+
+    /// `token_ids` cap — uses an oversize msgpack array length prefix.
+    /// rmp-serde reports `size_hint` from the prefix (an `array_len` is a
+    /// known length), so the visitor refuses before reading any element.
+    /// We deliberately under-fill the array to keep the test cheap; the
+    /// decoder rejects on the prefix alone.
+    #[test]
+    fn block_stored_oversize_token_ids_prefix_rejected() {
+        let claimed = (MAX_TOKENS_PER_EVENT + 1) as u32;
+
+        let mut event = Vec::new();
+        write_event_array(&mut event, "BlockStored", 7);
+        write_i64_array(&mut event, &[42_i64]); // block_hashes (small)
+        mp::write_nil(&mut event).unwrap(); // parent_block_hash
+        // Oversize token_ids: announce huge length but only write a
+        // single element. The visitor's size_hint check fires
+        // immediately and we never reach the truncated payload.
+        mp::write_array_len(&mut event, claimed).unwrap();
+        mp::write_uint(&mut event, 0).unwrap();
+        // Trailing bytes after the truncated array are ignored — the
+        // decoder errors out on the size_hint check before reading them.
+
+        let bytes = build_batch_bytes(0.0, &[event], None, true);
+
+        let err = decode_event_batch(&bytes).expect_err("oversize token prefix should fail");
+        match err {
+            DecodeError::PayloadTooLarge { field, len, cap } => {
+                assert_eq!(field, "token_ids");
+                assert_eq!(cap, MAX_TOKENS_PER_EVENT);
+                assert_eq!(len, claimed as usize);
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+    }
+
+    /// `BlockRemoved` is also covered. Uses the `block_hashes` cap.
+    #[test]
+    fn block_removed_with_too_many_hashes_rejected() {
+        let claimed = (MAX_HASHES_PER_EVENT + 1) as u32;
+
+        let mut event = Vec::new();
+        write_event_array(&mut event, "BlockRemoved", 3);
+        mp::write_array_len(&mut event, claimed).unwrap();
+        mp::write_sint(&mut event, 0).unwrap();
+        // Trailing bytes ignored — decoder errors on the size hint.
+
+        let bytes = build_batch_bytes(0.0, &[event], None, true);
+
+        let err = decode_event_batch(&bytes).expect_err("oversize hashes should fail");
+        match err {
+            DecodeError::PayloadTooLarge { field, cap, .. } => {
+                assert_eq!(field, "block_hashes");
+                assert_eq!(cap, MAX_HASHES_PER_EVENT);
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
     }
 }

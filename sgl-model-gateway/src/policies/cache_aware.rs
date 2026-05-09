@@ -65,7 +65,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
 use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
@@ -121,6 +121,16 @@ impl CacheAwarePolicy {
             None
         };
 
+        info!(
+            sync_mode = "mesh",
+            cache_threshold = config.cache_threshold,
+            balance_abs_threshold = config.balance_abs_threshold,
+            balance_rel_threshold = config.balance_rel_threshold,
+            eviction_interval_secs = config.eviction_interval_secs,
+            max_tree_size = config.max_tree_size,
+            "cache-aware mesh policy initialized"
+        );
+
         Self {
             config,
             trees,
@@ -165,6 +175,12 @@ impl CacheAwarePolicy {
     /// Add a single worker to the tree (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
         let tree_key = normalize_model_key(worker.model_id());
+        debug!(
+            sync_mode = "mesh",
+            worker_url = worker.url(),
+            model_key = %tree_key,
+            "cache-aware adding worker (mesh, no per-worker endpoint)"
+        );
         let tree = self
             .trees
             .entry(tree_key.to_string())

@@ -157,7 +157,10 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
-                ..
+                sync_mode: _,
+                block_size,
+                event_port,
+                event_channel_capacity,
             } => {
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
@@ -188,6 +191,44 @@ impl ConfigValidator {
                         field: "max_tree_size".to_string(),
                         value: max_tree_size.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                // ZMQ-mode bounds (also validated in mesh mode so an operator
+                // who flips `sync_mode` later does not discover a latent bad
+                // config). `block_size` underpins `compute_block_hashes`,
+                // which asserts > 0; the ceiling is a sanity guard against a
+                // misconfigured page_size that would explode the hash chain.
+                if *block_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "block_size".to_string(),
+                        value: block_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *block_size > 4096 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "block_size".to_string(),
+                        value: block_size.to_string(),
+                        reason: "Must be <= 4096 (sanity ceiling for KV block size)"
+                            .to_string(),
+                    });
+                }
+
+                if *event_port == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "event_port".to_string(),
+                        value: event_port.to_string(),
+                        reason: "Port must be > 0".to_string(),
+                    });
+                }
+
+                if *event_channel_capacity < 1 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "event_channel_capacity".to_string(),
+                        value: event_channel_capacity.to_string(),
+                        reason: "Must be >= 1".to_string(),
                     });
                 }
             }
@@ -743,6 +784,89 @@ mod tests {
             PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000),
         );
 
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// Helper that builds a valid `cache_aware` policy with caller-supplied
+    /// ZMQ knobs so each test below toggles only the field under test.
+    fn cache_aware_with_zmq_knobs(
+        block_size: usize,
+        event_port: u16,
+        event_channel_capacity: usize,
+    ) -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+            sync_mode: CacheAwareSyncMode::Zmq,
+            block_size,
+            event_port,
+            event_channel_capacity,
+        }
+    }
+
+    #[test]
+    fn test_validate_cache_aware_block_size_zero_rejected() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            cache_aware_with_zmq_knobs(0, 5557, 1024),
+        );
+        let err = ConfigValidator::validate(&config).expect_err("block_size=0 must fail");
+        assert!(format!("{err}").contains("block_size"));
+    }
+
+    #[test]
+    fn test_validate_cache_aware_block_size_too_large_rejected() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            cache_aware_with_zmq_knobs(4097, 5557, 1024),
+        );
+        let err =
+            ConfigValidator::validate(&config).expect_err("block_size > 4096 must fail");
+        assert!(format!("{err}").contains("block_size"));
+    }
+
+    #[test]
+    fn test_validate_cache_aware_event_port_zero_rejected() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            cache_aware_with_zmq_knobs(64, 0, 1024),
+        );
+        let err = ConfigValidator::validate(&config).expect_err("event_port=0 must fail");
+        assert!(format!("{err}").contains("event_port"));
+    }
+
+    #[test]
+    fn test_validate_cache_aware_event_channel_capacity_zero_rejected() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            cache_aware_with_zmq_knobs(64, 5557, 0),
+        );
+        let err = ConfigValidator::validate(&config)
+            .expect_err("event_channel_capacity=0 must fail");
+        assert!(format!("{err}").contains("event_channel_capacity"));
+    }
+
+    #[test]
+    fn test_validate_cache_aware_zmq_defaults_pass() {
+        // Sanity: the default ZMQ knobs (block_size=64, event_port=5557,
+        // event_channel_capacity=1024) pass validation.
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            cache_aware_with_zmq_knobs(64, 5557, 1024),
+        );
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 

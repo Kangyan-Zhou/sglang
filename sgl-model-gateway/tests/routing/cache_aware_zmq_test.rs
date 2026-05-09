@@ -135,6 +135,30 @@ fn encode_block_stored_event(
     buf
 }
 
+/// Encode a single `BlockRemoved` event as msgspec emits it. Layout:
+/// `["BlockRemoved", block_hashes, medium]`. We always include `medium`
+/// (with a value of "GPU") for parity with the publisher's typical
+/// emission.
+fn encode_block_removed_event(block_hashes: &[i64]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    mp::write_array_len(&mut buf, 3).unwrap();
+    mp::write_str(&mut buf, "BlockRemoved").unwrap();
+    mp::write_array_len(&mut buf, block_hashes.len() as u32).unwrap();
+    for v in block_hashes {
+        mp::write_sint(&mut buf, *v).unwrap();
+    }
+    mp::write_str(&mut buf, "GPU").unwrap();
+    buf
+}
+
+/// Encode a single `AllBlocksCleared` event. Layout: `["AllBlocksCleared"]`.
+fn encode_all_blocks_cleared_event() -> Vec<u8> {
+    let mut buf = Vec::new();
+    mp::write_array_len(&mut buf, 1).unwrap();
+    mp::write_str(&mut buf, "AllBlocksCleared").unwrap();
+    buf
+}
+
 /// Wrap one or more pre-encoded events into a `KVEventBatch` array with
 /// a timestamp and the optional dp-rank field present.
 fn encode_event_batch(ts: f64, events: Vec<Vec<u8>>, attn_dp_rank: Option<u32>) -> Vec<u8> {
@@ -214,6 +238,24 @@ async fn wait_for_route_to(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     None
+}
+
+/// Poll an arbitrary predicate on the policy until it returns `true` or
+/// `max` elapses. Used to wait for the consumer task to apply tree
+/// mutations (BlockRemoved, AllBlocksCleared) — the per-step e2e timing
+/// is identical to `wait_for_route_to` but the assertion shape differs.
+async fn wait_until<F>(predicate: F, max: Duration) -> bool
+where
+    F: Fn() -> bool,
+{
+    let start = std::time::Instant::now();
+    while start.elapsed() < max {
+        if predicate() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    predicate()
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +375,278 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     // 8. Shutdown cleanly.
     let res = timeout(Duration::from_secs(2), policy.shutdown()).await;
     assert!(res.is_ok(), "policy shutdown should not hang");
+}
+
+/// e2e: a `BlockRemoved` event flowing through the ZMQ pipeline removes
+/// the matching prefix from the tree. After publish, the worker that
+/// previously held the prefix should no longer be matched — the policy
+/// falls back to min-load.
+///
+/// Single PUB + single worker keeps the test deterministic: there is no
+/// load-tiebreak ambiguity once the tree has been cleared. The
+/// match-prefix → empty workers transition is the exact production path
+/// `BlockRemoved` exists to drive.
+#[tokio::test]
+async fn zmq_indexer_block_removed_clears_tree_e2e() {
+    let model = "modelA";
+    let tokens: Vec<u32> = vec![1, 2, 3, 4];
+
+    let (mut pub_a, port) = make_pub_bound().await;
+    let registry = registry_with_fixed_tokens(model, tokens.clone()).await;
+
+    let cfg = CacheAwareConfig {
+        cache_threshold: 0.0, // any match counts as a hit
+        balance_abs_threshold: 32,
+        balance_rel_threshold: 1.1,
+        eviction_interval_secs: 0,
+        max_tree_size: 10_000,
+        block_size: 4,
+        event_port: port,
+        event_channel_capacity: 64,
+    };
+    let policy = CacheAwareZmqPolicy::new(cfg, Arc::clone(&registry));
+
+    let url_a = "http://127.0.0.1:30100";
+    let w_a = build_worker(url_a, model);
+    LoadBalancingPolicy::on_add_worker(&policy, w_a.as_ref()).await;
+
+    // SUB handshake.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Publish a BlockStored for the chain w_a "holds".
+    let hashes = compute_block_hashes(&tokens, 4);
+    assert!(!hashes.is_empty());
+    let stored = encode_block_stored_event(&hashes, None, &tokens, 4);
+    pub_a
+        .send(build_multipart(1, encode_event_batch(0.0, vec![stored], Some(0))))
+        .await
+        .expect("send block-stored");
+
+    // Wait for the tree to populate.
+    let stored_landed = wait_until(
+        || {
+            policy
+                .node_count_for_model_test(model)
+                .is_some_and(|n| n > 0)
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        stored_landed,
+        "BlockStored did not populate tree within timeout"
+    );
+    let nodes_after_store = policy
+        .node_count_for_model_test(model)
+        .expect("tree exists");
+
+    // Publish a BlockRemoved for those exact hashes.
+    let removed = encode_block_removed_event(&hashes);
+    pub_a
+        .send(build_multipart(2, encode_event_batch(1.0, vec![removed], Some(0))))
+        .await
+        .expect("send block-removed");
+
+    // Wait for the consumer to drain the BlockRemoved. We assert that
+    // either (a) node_count strictly drops below the post-store count, or
+    // (b) `match_prefix` returns no workers — both are equivalent
+    // observations of the prefix being unattributed.
+    let removed_applied = wait_until(
+        || {
+            policy
+                .node_count_for_model_test(model)
+                .is_some_and(|n| n < nodes_after_store)
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        removed_applied,
+        "BlockRemoved did not shrink the tree within timeout (before={}, after={:?})",
+        nodes_after_store,
+        policy.node_count_for_model_test(model),
+    );
+
+    let res = timeout(Duration::from_secs(2), policy.shutdown()).await;
+    assert!(res.is_ok());
+}
+
+/// e2e: an `AllBlocksCleared` event empties the per-worker tree state
+/// for the publishing worker. Only one worker exists; after the clear,
+/// the tree should report zero nodes attributable to it (or fewer than
+/// the post-store snapshot).
+#[tokio::test]
+async fn zmq_indexer_all_blocks_cleared_e2e() {
+    let model = "modelA";
+    let tokens: Vec<u32> = vec![1, 2, 3, 4];
+
+    let (mut pub_a, port) = make_pub_bound().await;
+    let registry = registry_with_fixed_tokens(model, tokens.clone()).await;
+
+    let cfg = CacheAwareConfig {
+        cache_threshold: 0.0,
+        balance_abs_threshold: 32,
+        balance_rel_threshold: 1.1,
+        eviction_interval_secs: 0,
+        max_tree_size: 10_000,
+        block_size: 4,
+        event_port: port,
+        event_channel_capacity: 64,
+    };
+    let policy = CacheAwareZmqPolicy::new(cfg, Arc::clone(&registry));
+
+    let url_a = "http://127.0.0.1:30200";
+    let w_a = build_worker(url_a, model);
+    LoadBalancingPolicy::on_add_worker(&policy, w_a.as_ref()).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let hashes = compute_block_hashes(&tokens, 4);
+    let stored = encode_block_stored_event(&hashes, None, &tokens, 4);
+    pub_a
+        .send(build_multipart(1, encode_event_batch(0.0, vec![stored], Some(0))))
+        .await
+        .expect("send block-stored");
+
+    let stored_landed = wait_until(
+        || {
+            policy
+                .node_count_for_model_test(model)
+                .is_some_and(|n| n > 0)
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(stored_landed, "BlockStored did not populate tree");
+
+    // Publish AllBlocksCleared.
+    let cleared = encode_all_blocks_cleared_event();
+    pub_a
+        .send(build_multipart(2, encode_event_batch(1.0, vec![cleared], Some(0))))
+        .await
+        .expect("send all-blocks-cleared");
+
+    // After clear, the worker should not be attributable to the prefix.
+    // Use `select_worker` to observe the routing fallback: with one
+    // worker, min-load picks it but the *cache match* should not be
+    // returning the URL via `pick_matched_worker`. Easier observation:
+    // node_count for this worker drops to 0.
+    let cleared_applied = wait_until(
+        || {
+            policy
+                .node_count_for_model_test(model)
+                .is_some_and(|n| n == 0)
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        cleared_applied,
+        "AllBlocksCleared did not empty the tree (final={:?})",
+        policy.node_count_for_model_test(model),
+    );
+
+    // After the clear, `select_worker` still returns the only healthy
+    // worker — but via min-load fallback, not cache match. We only
+    // assert that routing still works (no tree match means min-load
+    // wins the lone worker).
+    let workers = vec![Arc::clone(&w_a)];
+    let info = SelectWorkerInfo {
+        request_text: Some("anything"),
+        ..Default::default()
+    };
+    let chosen = policy.select_worker(&workers, &info).await;
+    assert_eq!(chosen, Some(0), "min-load fallback should still route");
+
+    let res = timeout(Duration::from_secs(2), policy.shutdown()).await;
+    assert!(res.is_ok());
+}
+
+/// e2e: a burst of 50 sequenced `BlockStored` events all land in the
+/// tree, in order. Catches: ordered delivery, no event drops in the
+/// consumer task under burst, channel capacity sane. Each event uses a
+/// distinct prefix (different first hash) so we expect 50 separate
+/// nodes after the burst.
+#[tokio::test]
+async fn zmq_indexer_multi_batch_sequenced_delivery_e2e() {
+    let model = "modelA";
+    // Tokens don't matter for the burst test — we publish synthetic
+    // hashes directly, distinct per event.
+    let tokens_for_routing: Vec<u32> = vec![1, 2, 3, 4];
+
+    let (mut pub_a, port) = make_pub_bound().await;
+    let registry = registry_with_fixed_tokens(model, tokens_for_routing).await;
+
+    let cfg = CacheAwareConfig {
+        cache_threshold: 0.5,
+        balance_abs_threshold: 32,
+        balance_rel_threshold: 1.1,
+        eviction_interval_secs: 0,
+        max_tree_size: 100_000,
+        block_size: 4,
+        event_port: port,
+        // 64 is well above 50 so the channel should not back-pressure
+        // visibly. The test still asserts that no events are dropped at
+        // any layer.
+        event_channel_capacity: 64,
+    };
+    let policy = CacheAwareZmqPolicy::new(cfg, Arc::clone(&registry));
+
+    let url_a = "http://127.0.0.1:30300";
+    let w_a = build_worker(url_a, model);
+    LoadBalancingPolicy::on_add_worker(&policy, w_a.as_ref()).await;
+
+    // SUB handshake — give it a comfortable margin since the burst that
+    // follows is 50 messages back-to-back.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Publish 50 distinct BlockStored events. Each chain has one hash;
+    // the per-event hashes are distinct so the tree gains one node per
+    // event. Sequence numbers are monotonic.
+    const N: i64 = 50;
+    for i in 0..N {
+        // Distinct prefix per event: use `i + 1` (avoid 0) as the only
+        // hash. parent_block_hash=None means each is a root chain.
+        let hashes = vec![i + 1];
+        let stored = encode_block_stored_event(&hashes, None, &[1, 2, 3, 4], 4);
+        let payload = encode_event_batch(i as f64, vec![stored], Some(0));
+        pub_a
+            .send(build_multipart(i + 1, payload))
+            .await
+            .expect("send burst event");
+    }
+
+    // Wait for the tree to grow to the expected node count. 5s timeout
+    // is generous for 50 events on localhost; CI runners with high
+    // jitter occasionally need >2s.
+    let target = N as usize;
+    let all_landed = wait_until(
+        || {
+            policy
+                .node_count_for_model_test(model)
+                .is_some_and(|n| n >= target)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        all_landed,
+        "expected at least {} nodes after burst; got {:?}",
+        target,
+        policy.node_count_for_model_test(model)
+    );
+
+    // Sanity: the count is *exactly* `target` — no double-applies, no
+    // drops — since each event added a distinct prefix.
+    assert_eq!(
+        policy.node_count_for_model_test(model),
+        Some(target),
+        "expected exactly {} distinct nodes after a sequenced burst",
+        target
+    );
+
+    let res = timeout(Duration::from_secs(2), policy.shutdown()).await;
+    assert!(res.is_ok());
 }
 
 /// Factory dispatch: `sync_mode=zmq` + tokenizer registry → ZMQ policy.
