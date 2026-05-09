@@ -9,8 +9,10 @@
 //! `array_like=True, omit_defaults=True, gc=False, tag=True`) and the
 //! gateway-side indexer.
 
+pub mod hash;
 pub mod wire;
 
+pub use hash::{compute_block_hashes, sha256_to_i64};
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,
 };
