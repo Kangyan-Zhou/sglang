@@ -10,9 +10,11 @@
 //! gateway-side indexer.
 
 pub mod hash;
+pub mod tree;
 pub mod wire;
 
 pub use hash::{compute_block_hashes, sha256_to_i64};
+pub use tree::{HashTree, KvWorkerId, MatchResult};
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,
 };
