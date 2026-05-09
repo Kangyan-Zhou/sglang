@@ -12,6 +12,7 @@ use crate::core::{HashRing, Worker};
 
 mod bucket;
 mod cache_aware;
+mod cache_aware_zmq;
 mod consistent_hashing;
 mod factory;
 pub mod kv_events;
@@ -25,6 +26,7 @@ pub mod tree;
 pub(crate) mod utils;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
+pub use cache_aware_zmq::CacheAwareZmqPolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
 pub use manual::{ManualConfig, ManualPolicy};
@@ -102,6 +104,19 @@ pub struct CacheAwareConfig {
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
+    /// Tokens per KV-cache block. Used by [`CacheAwareZmqPolicy`] when
+    /// computing block hashes for an incoming request; must match the
+    /// publisher's `block_size` (SGLang `page_size`).
+    pub block_size: usize,
+    /// Base port for ZMQ KV-event subscriptions. The actual port for a
+    /// given DP rank is `event_port + dp_rank`.
+    pub event_port: u16,
+    /// Buffer capacity of the mpsc channel that carries decoded
+    /// [`super::policies::kv_events::WorkerEvent`]s from the subscriber
+    /// registry to the consumer task. Bounded so that a slow consumer
+    /// applies backpressure to subscribers rather than letting the queue
+    /// grow unboundedly.
+    pub event_channel_capacity: usize,
 }
 
 impl Default for CacheAwareConfig {
@@ -112,6 +127,9 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+            block_size: 64,
+            event_port: 5557,
+            event_channel_capacity: 1024,
         }
     }
 }

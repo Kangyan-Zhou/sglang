@@ -585,6 +585,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            ..CacheAwareConfig::default()
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")

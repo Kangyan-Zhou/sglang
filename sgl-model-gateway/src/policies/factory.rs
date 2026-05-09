@@ -26,12 +26,16 @@ impl PolicyFactory {
                 eviction_interval_secs,
                 max_tree_size,
             } => {
+                let defaults = CacheAwareConfig::default();
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
                     balance_abs_threshold: *balance_abs_threshold,
                     balance_rel_threshold: *balance_rel_threshold,
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
+                    block_size: defaults.block_size,
+                    event_port: defaults.event_port,
+                    event_channel_capacity: defaults.event_channel_capacity,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }

@@ -192,6 +192,23 @@ impl KvEventSubscriberRegistry {
         }
     }
 
+    /// Sync cancellation: triggers every per-worker token without awaiting
+    /// the join handles. Use this when you cannot `.await` (e.g., from
+    /// `Drop`). After calling this, the subscriber tasks will exit on their
+    /// next yield point. Subscriptions and ZMQ sockets are released by
+    /// tokio task cleanup.
+    ///
+    /// If `try_lock` fails, the registry is mid-mutation elsewhere
+    /// (`shutdown`, `add_worker`, `remove_worker`); the cancel is
+    /// redundant in that case so we drop the call.
+    pub fn cancel_all(&self) {
+        if let Ok(handles) = self.inner.handles.try_lock() {
+            for h in handles.values() {
+                h.cancel.cancel();
+            }
+        }
+    }
+
     /// Cancel everything and await shutdown. Caller is responsible for
     /// draining any remaining events on the receiver side.
     pub async fn shutdown(&self) {
@@ -826,6 +843,34 @@ mod tests {
         }
 
         registry.shutdown().await;
+    }
+
+    /// `cancel_all` signals every per-worker token without awaiting; a
+    /// subsequent `shutdown` must still complete cleanly. This is the
+    /// path `CacheAwareZmqPolicy::Drop` relies on so subscriber tasks
+    /// don't leak when the policy is dropped without an explicit
+    /// `shutdown()`.
+    #[tokio::test]
+    async fn cancel_all_then_shutdown_is_clean() {
+        let (_pub_sock, port) = helpers::make_pub_bound().await;
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>(8);
+        let registry = KvEventSubscriberRegistry::new(tx);
+
+        registry
+            .add_worker(
+                "http://127.0.0.1:30000",
+                &helpers::cfg_for("http://127.0.0.1:30000", port, 2),
+            )
+            .await;
+        helpers::settle().await;
+
+        // Sync cancel — must not block, must not panic.
+        registry.cancel_all();
+
+        // shutdown should still join cleanly even though the per-worker
+        // tokens were already fired by cancel_all.
+        let done = timeout(Duration::from_millis(500), registry.shutdown()).await;
+        assert!(done.is_ok(), "shutdown after cancel_all must not hang");
     }
 
     /// Direct unit test of [`extract_host`] — no socket required.
