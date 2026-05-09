@@ -108,6 +108,10 @@ arc-swap = "1.7.1"
 
 # KV-cache event indexer (msgpack wire format from SGLang's ZmqEventPublisher)
 rmp-serde = "1"
+# Pure-Rust ZMTP implementation (no libzmq system dep). Supports PUB/SUB,
+# TCP transport, multipart messages, and auto-reconnect on the SUB side.
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # gRPC and Protobuf dependencies
 smg-grpc-client = "=1.0.0"
