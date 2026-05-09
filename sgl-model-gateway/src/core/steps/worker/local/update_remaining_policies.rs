@@ -35,13 +35,18 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
             let remaining_workers = app_context.worker_registry.get_by_model(model_id);
 
             if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
-                if policy.name() == "cache_aware" && !remaining_workers.is_empty() {
+                let policy_name = policy.name();
+                if (policy_name == "cache_aware" || policy_name == "cache_aware_zmq")
+                    && !remaining_workers.is_empty()
+                {
                     app_context
                         .policy_registry
-                        .init_cache_aware_policy(model_id, &remaining_workers);
+                        .init_cache_aware_policy(model_id, &remaining_workers)
+                        .await;
 
                     debug!(
-                        "Updated cache-aware policy for model {} ({} remaining workers)",
+                        "Updated {} policy for model {} ({} remaining workers)",
+                        policy_name,
                         model_id,
                         remaining_workers.len()
                     );

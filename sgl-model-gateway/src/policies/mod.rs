@@ -85,6 +85,24 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't use mesh sync
     }
 
+    /// Notify the policy that a worker has been added.
+    ///
+    /// Called by the worker-registration path (service discovery / manual
+    /// add) for policies that need to react to worker membership changes.
+    /// Cache-aware variants use this to register subscribers and seed
+    /// per-model trees; stateless policies leave the default no-op.
+    async fn on_add_worker(&self, _worker: &dyn Worker) {
+        // Default: no-op for policies that don't track workers explicitly.
+    }
+
+    /// Notify the policy that a worker has been removed.
+    ///
+    /// Counterpart to [`Self::on_add_worker`]. Used by cache-aware variants
+    /// to drop subscribers and clear stale tree entries.
+    async fn on_remove_worker(&self, _worker: &dyn Worker) {
+        // Default: no-op for policies that don't track workers explicitly.
+    }
+
     /// Reset any internal state
     ///
     /// This is useful for policies that maintain state (e.g., round-robin counters).

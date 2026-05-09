@@ -164,13 +164,7 @@ mod pd_routing_unit_tests {
                     prefill_policy: None,
                     decode_policy: None,
                 },
-                PolicyConfig::CacheAware {
-                    cache_threshold: 0.7,
-                    balance_abs_threshold: 20,
-                    balance_rel_threshold: 1.2,
-                    eviction_interval_secs: 60,
-                    max_tree_size: 1000000,
-                },
+                PolicyConfig::cache_aware(0.7, 20, 1.2, 60, 1_000_000),
             ),
             (
                 RoutingMode::PrefillDecode {

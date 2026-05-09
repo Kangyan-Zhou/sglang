@@ -265,6 +265,33 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        /// Cache-state synchronization backend.
+        ///
+        /// * `Mesh` (default) — workers gossip approximate-tree updates over
+        ///   `smg_mesh`; the gateway only sees post-routing inserts. Matches
+        ///   the pre-ZMQ status quo; enabled unless a config explicitly
+        ///   opts into ZMQ.
+        /// * `Zmq` (opt-in) — the gateway subscribes directly to each
+        ///   worker's KV-cache event stream over ZMQ and indexes
+        ///   `BlockStored`/`BlockRemoved` events into a hash-keyed radix tree.
+        ///   Requires SGLang workers to be started with the matching
+        ///   `--kv-events-config` publisher.
+        #[serde(default)]
+        sync_mode: CacheAwareSyncMode,
+        /// Tokens per KV-cache block; must match the publisher's `block_size`
+        /// (SGLang `page_size`). Used by `CacheAwareZmqPolicy` when computing
+        /// block hashes for an incoming request. Ignored in `Mesh` mode.
+        #[serde(default = "default_cache_aware_block_size")]
+        block_size: usize,
+        /// Base port for ZMQ KV-event subscriptions. The actual port for a
+        /// given DP rank is `event_port + dp_rank`. Ignored in `Mesh` mode.
+        #[serde(default = "default_cache_aware_event_port")]
+        event_port: u16,
+        /// Buffer capacity of the mpsc channel between the per-worker ZMQ
+        /// subscribers and the in-process consumer task that applies events
+        /// to the hash tree. Ignored in `Mesh` mode.
+        #[serde(default = "default_cache_aware_event_channel_capacity")]
+        event_channel_capacity: usize,
     },
 
     #[serde(rename = "power_of_two")]
@@ -326,6 +353,46 @@ fn default_prefix_token_count() -> usize {
     256
 }
 
+// Single source of truth for cache-aware defaults: `CacheAwareConfig::default()`.
+// The serde defaults below delegate to it so a change to one constant does not
+// require touching two files.
+
+fn default_cache_aware_block_size() -> usize {
+    crate::policies::CacheAwareConfig::default().block_size
+}
+
+fn default_cache_aware_event_port() -> u16 {
+    crate::policies::CacheAwareConfig::default().event_port
+}
+
+fn default_cache_aware_event_channel_capacity() -> usize {
+    crate::policies::CacheAwareConfig::default().event_channel_capacity
+}
+
+/// How the cache-aware policy keeps its in-memory tree in sync with worker state.
+///
+/// Selected at config time via the `sync_mode` field on
+/// [`PolicyConfig::CacheAware`]. Defaults to [`CacheAwareSyncMode::Mesh`] —
+/// existing deployments keep the pre-ZMQ gossip behavior and must explicitly
+/// opt into the new ZMQ KV-event indexer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheAwareSyncMode {
+    /// Legacy mesh-based gossip: cache-aware tree updates are propagated
+    /// across gateway nodes via `smg_mesh::OptionalMeshSyncManager`. Picks
+    /// the existing `CacheAwarePolicy` implementation in [`policies::CacheAwarePolicy`].
+    /// This is the default — selected when `sync_mode` is omitted from config.
+    #[default]
+    Mesh,
+    /// ZMQ KV-event indexer: the gateway subscribes to each worker's KV
+    /// event publisher and applies `BlockStored`/`BlockRemoved` events to a
+    /// hash-keyed radix tree. Picks [`crate::policies::CacheAwareZmqPolicy`].
+    /// Opt-in: requires SGLang workers to expose a matching event publisher
+    /// (`--kv-events-config`) and a `TokenizerRegistry` wired through the
+    /// factory. Without those, the factory falls back to `Mesh` with a warn log.
+    Zmq,
+}
+
 fn default_load_factor() -> f64 {
     1.25
 }
@@ -349,6 +416,30 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+        }
+    }
+
+    /// Convenience constructor for [`PolicyConfig::CacheAware`] that fills
+    /// in `sync_mode` and the ZMQ tuning fields with their defaults.
+    /// Tests and call sites that don't care about the ZMQ knobs can use
+    /// this to stay backward-compatible after the T6 schema change.
+    pub fn cache_aware(
+        cache_threshold: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    ) -> Self {
+        PolicyConfig::CacheAware {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            eviction_interval_secs,
+            max_tree_size,
+            sync_mode: CacheAwareSyncMode::default(),
+            block_size: default_cache_aware_block_size(),
+            event_port: default_cache_aware_event_port(),
+            event_channel_capacity: default_cache_aware_event_channel_capacity(),
         }
     }
 }
@@ -806,13 +897,7 @@ mod tests {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.8, 10, 1.5, 300, 1000);
         assert_eq!(cache_aware.name(), "cache_aware");
 
         let power_of_two = PolicyConfig::PowerOfTwo {
@@ -827,13 +912,7 @@ mod tests {
         let json = serde_json::to_string(&random).unwrap();
         assert_eq!(json, r#"{"type":"random"}"#);
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.8, 10, 1.5, 300, 1000);
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
         assert!(json.contains("\"cache_threshold\":0.8"));
@@ -849,13 +928,7 @@ mod tests {
 
     #[test]
     fn test_cache_aware_parameters() {
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.75,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 2.0,
-            eviction_interval_secs: 600,
-            max_tree_size: 5000,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.75, 20, 2.0, 600, 5000);
 
         match cache_aware {
             PolicyConfig::CacheAware {
@@ -864,6 +937,7 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                ..
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
@@ -1251,13 +1325,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-            }),
+            prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
             }),
@@ -1281,13 +1349,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-            }),
+            prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
             decode_policy: None,
         };
 
@@ -1337,13 +1399,7 @@ mod tests {
             decode_policy: None,
         };
 
-        let main_policy = PolicyConfig::CacheAware {
-            cache_threshold: 0.7,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 2000,
-        };
+        let main_policy = PolicyConfig::cache_aware(0.7, 20, 1.5, 300, 2000);
 
         match pd.get_prefill_policy(&main_policy) {
             PolicyConfig::CacheAware {

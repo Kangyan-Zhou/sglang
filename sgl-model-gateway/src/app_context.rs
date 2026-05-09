@@ -424,7 +424,14 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::new(config.policy.clone())));
+        // The tokenizer registry is initialised earlier in
+        // [`Self::with_tokenizer_registry`]; pass it through so the
+        // `cache_aware` policy with `sync_mode=zmq` can be constructed.
+        let tokenizer_registry = self.tokenizer_registry.clone();
+        self.policy_registry = Some(Arc::new(PolicyRegistry::new_with_tokenizer_registry(
+            config.policy.clone(),
+            tokenizer_registry,
+        )));
         self
     }
 

@@ -157,6 +157,7 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                ..
             } => {
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
@@ -723,13 +724,10 @@ mod tests {
                     "http://worker2:8000".to_string(),
                 ],
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 1.5, // Invalid: > 1.0
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-            },
+            PolicyConfig::cache_aware(
+                1.5, // Invalid: > 1.0
+                32, 1.1, 60, 1000,
+            ),
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
@@ -742,13 +740,7 @@ mod tests {
             RoutingMode::Regular {
                 worker_urls: vec!["http://worker1:8000".to_string()],
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-            },
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000),
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
@@ -796,13 +788,7 @@ mod tests {
                 prefill_policy: None,
                 decode_policy: None,
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-            },
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000),
         );
 
         let result = ConfigValidator::validate(&config);
@@ -840,13 +826,7 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
-                prefill_policy: Some(PolicyConfig::CacheAware {
-                    cache_threshold: 0.5,
-                    balance_abs_threshold: 32,
-                    balance_rel_threshold: 1.1,
-                    eviction_interval_secs: 60,
-                    max_tree_size: 1000,
-                }),
+                prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
                 }),

@@ -116,13 +116,13 @@ impl RouterConfigBuilder {
         eviction_interval_secs: u64,
         max_tree_size: usize,
     ) -> Self {
-        self.config.policy = PolicyConfig::CacheAware {
+        self.config.policy = PolicyConfig::cache_aware(
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
-        };
+        );
         self
     }
 

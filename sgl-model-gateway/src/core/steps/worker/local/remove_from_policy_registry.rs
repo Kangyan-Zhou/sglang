@@ -38,10 +38,13 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             let model_id = worker.model_id().to_string();
             let worker_url = worker.url();
 
-            // Remove from cache-aware policy
+            // Remove from cache-aware policy. Pass the Worker so the
+            // ZMQ variant can use it to clear all DP ranks; the mesh
+            // variant only needs the URL.
             app_context
                 .policy_registry
-                .remove_worker_from_cache_aware(&model_id, worker_url);
+                .remove_worker_from_cache_aware(&model_id, worker_url, Some(worker.as_ref()))
+                .await;
 
             // Notify policy registry
             app_context.policy_registry.on_worker_removed(&model_id);

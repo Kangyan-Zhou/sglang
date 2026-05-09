@@ -548,6 +548,17 @@ impl LoadBalancingPolicy for CacheAwareZmqPolicy {
         true
     }
 
+    async fn on_add_worker(&self, worker: &dyn Worker) {
+        // Forward to the inherent async `add_worker` so the worker-add hook
+        // in the registration workflow flows through here. The inherent
+        // method is kept public for tests and direct callers.
+        self.add_worker(worker).await;
+    }
+
+    async fn on_remove_worker(&self, worker: &dyn Worker) {
+        self.remove_worker(worker).await;
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

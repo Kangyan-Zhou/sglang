@@ -118,10 +118,12 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             // Check for configuration conflicts between prefill and decode
             self.check_worker_conflicts(&model_id, &all_workers);
             if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
+                let policy_name = policy.name();
+                if policy_name == "cache_aware" || policy_name == "cache_aware_zmq" {
                     app_context
                         .policy_registry
-                        .init_cache_aware_policy(&model_id, &all_workers);
+                        .init_cache_aware_policy(&model_id, &all_workers)
+                        .await;
                 }
             }
 

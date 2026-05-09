@@ -77,10 +77,15 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+        let tokenizer_registry = Some(Arc::clone(&ctx.tokenizer_registry));
+        let prefill_policy = PolicyFactory::create_from_config_with_registry(
+            prefill_policy_config.unwrap_or(main_policy_config),
+            tokenizer_registry.clone(),
+        );
+        let decode_policy = PolicyFactory::create_from_config_with_registry(
+            decode_policy_config.unwrap_or(main_policy_config),
+            tokenizer_registry,
+        );
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
@@ -104,10 +109,15 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+        let tokenizer_registry = Some(Arc::clone(&ctx.tokenizer_registry));
+        let prefill_policy = PolicyFactory::create_from_config_with_registry(
+            prefill_policy_config.unwrap_or(main_policy_config),
+            tokenizer_registry.clone(),
+        );
+        let decode_policy = PolicyFactory::create_from_config_with_registry(
+            decode_policy_config.unwrap_or(main_policy_config),
+            tokenizer_registry,
+        );
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);

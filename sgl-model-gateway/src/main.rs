@@ -5,11 +5,11 @@ use rand::{distr::Alphanumeric, Rng};
 use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
-        DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
+        CacheAwareSyncMode, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+        HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode,
+        TokenizerCacheConfig, TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
+        DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
     core::ConnectionMode,
     observability::{
@@ -185,6 +185,30 @@ struct CliArgs {
     /// Load factor threshold for prefix_hash policy
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
+
+    /// Cache-state sync transport for the cache_aware policy.
+    /// `mesh` keeps the legacy smg_mesh gossip path; `zmq` opts into the
+    /// in-process ZMQ KV-event indexer (requires SGLang workers running with
+    /// `--kv-events-config`).
+    #[arg(long, default_value = "mesh", value_parser = ["mesh", "zmq"], help_heading = "Routing Policy")]
+    cache_aware_sync_mode: String,
+
+    /// Tokens per KV-cache block for cache_aware/zmq; must match the SGLang
+    /// publisher's `page_size`. Ignored when `--cache-aware-sync-mode mesh`.
+    #[arg(long, default_value_t = 64, help_heading = "Routing Policy")]
+    cache_aware_block_size: usize,
+
+    /// Base port for ZMQ KV-event subscriptions in cache_aware/zmq mode. Per
+    /// DP rank the gateway subscribes to `event_port + dp_rank`. Ignored when
+    /// `--cache-aware-sync-mode mesh`.
+    #[arg(long, default_value_t = 5557, help_heading = "Routing Policy")]
+    cache_aware_event_port: u16,
+
+    /// mpsc buffer between per-worker ZMQ subscribers and the consumer task
+    /// that applies events to the hash tree. Ignored when
+    /// `--cache-aware-sync-mode mesh`.
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    cache_aware_event_channel_capacity: usize,
 
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -766,6 +790,15 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                sync_mode: match self.cache_aware_sync_mode.as_str() {
+                    "zmq" => CacheAwareSyncMode::Zmq,
+                    // Default and explicit "mesh" both resolve to Mesh; the
+                    // clap value_parser already restricts the input.
+                    _ => CacheAwareSyncMode::Mesh,
+                },
+                block_size: self.cache_aware_block_size,
+                event_port: self.cache_aware_event_port,
+                event_channel_capacity: self.cache_aware_event_channel_capacity,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -1272,4 +1305,89 @@ Provide --worker-urls or PD flags as usual.",
         shutdown_otel();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `Args` by parsing a flag vector through clap, so the
+    /// test exercises the same CLI surface that `main` does. The first arg is
+    /// the program name (ignored by clap but required by `parse_from`).
+    fn parse_args(extra: &[&str]) -> CliArgs {
+        let mut argv: Vec<&str> = vec!["smg"];
+        argv.extend(extra);
+        CliArgs::parse_from(argv)
+    }
+
+    /// Default CLI (no cache-aware overrides) selects mesh sync — preserves
+    /// the legacy behavior on upgrade.
+    #[test]
+    fn cli_cache_aware_defaults_to_mesh() {
+        let args = parse_args(&["--policy", "cache_aware"]);
+        match args.parse_policy("cache_aware") {
+            PolicyConfig::CacheAware {
+                sync_mode,
+                block_size,
+                event_port,
+                event_channel_capacity,
+                ..
+            } => {
+                assert_eq!(sync_mode, CacheAwareSyncMode::Mesh);
+                assert_eq!(block_size, 64);
+                assert_eq!(event_port, 5557);
+                assert_eq!(event_channel_capacity, 1024);
+            }
+            _ => panic!("expected CacheAware variant"),
+        }
+    }
+
+    /// `--cache-aware-sync-mode zmq` plus the ZMQ tuning flags round-trip into
+    /// `PolicyConfig::CacheAware { sync_mode: Zmq, ... }`. Without this wiring
+    /// there is no CLI path to the ZMQ KV-event indexer.
+    #[test]
+    fn cli_cache_aware_zmq_round_trips() {
+        let args = parse_args(&[
+            "--policy",
+            "cache_aware",
+            "--cache-aware-sync-mode",
+            "zmq",
+            "--cache-aware-block-size",
+            "128",
+            "--cache-aware-event-port",
+            "6000",
+            "--cache-aware-event-channel-capacity",
+            "2048",
+        ]);
+        match args.parse_policy("cache_aware") {
+            PolicyConfig::CacheAware {
+                sync_mode,
+                block_size,
+                event_port,
+                event_channel_capacity,
+                ..
+            } => {
+                assert_eq!(sync_mode, CacheAwareSyncMode::Zmq);
+                assert_eq!(block_size, 128);
+                assert_eq!(event_port, 6000);
+                assert_eq!(event_channel_capacity, 2048);
+            }
+            _ => panic!("expected CacheAware variant"),
+        }
+    }
+
+    /// clap rejects unknown sync_mode values — the value_parser is the only
+    /// place input is restricted, so a regression that drops it would silently
+    /// accept arbitrary strings.
+    #[test]
+    fn cli_cache_aware_sync_mode_rejects_unknown() {
+        let res = CliArgs::try_parse_from([
+            "smg",
+            "--policy",
+            "cache_aware",
+            "--cache-aware-sync-mode",
+            "wat",
+        ]);
+        assert!(res.is_err(), "clap should reject sync_mode=wat");
+    }
 }

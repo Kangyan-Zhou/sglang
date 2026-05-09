@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
+use crate::tokenizer::TokenizerRegistry;
 use crate::{config::types::PolicyConfig, core::Worker};
 
 /// Registry for managing model-to-policy mappings
@@ -36,12 +37,36 @@ pub struct PolicyRegistry {
     /// When None, the registry works independently without mesh synchronization
     /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
     mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
+
+    /// Shared tokenizer registry. Cloned into [`super::CacheAwareZmqPolicy`]
+    /// instances when the cache-aware policy is configured with
+    /// `sync_mode = zmq`. `None` for legacy callers that have not been
+    /// migrated yet — those will see a warn-and-fallback in [`PolicyFactory`].
+    tokenizer_registry: Option<Arc<TokenizerRegistry>>,
 }
 
 impl PolicyRegistry {
-    /// Create a new PolicyRegistry with a default policy
+    /// Create a new PolicyRegistry with a default policy.
+    ///
+    /// Use [`Self::new_with_tokenizer_registry`] to enable the
+    /// `sync_mode=zmq` branch of `cache_aware`. This constructor leaves the
+    /// tokenizer registry unset; an explicit `sync_mode=zmq` config will
+    /// then fall back to the mesh policy (with a warn log).
     pub fn new(default_policy_config: PolicyConfig) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
+        Self::new_with_tokenizer_registry(default_policy_config, None)
+    }
+
+    /// Create a new PolicyRegistry, optionally wired with a shared
+    /// `TokenizerRegistry`. Required for `cache_aware` policies that opt
+    /// into `sync_mode = zmq`; the default `sync_mode = mesh` ignores it.
+    pub fn new_with_tokenizer_registry(
+        default_policy_config: PolicyConfig,
+        tokenizer_registry: Option<Arc<TokenizerRegistry>>,
+    ) -> Self {
+        let default_policy = PolicyFactory::create_from_config_with_registry(
+            &default_policy_config,
+            tokenizer_registry.clone(),
+        );
 
         Self {
             model_policies: Arc::new(DashMap::new()),
@@ -50,7 +75,15 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
             mesh_sync: Arc::new(RwLock::new(None)),
+            tokenizer_registry,
         }
+    }
+
+    /// Get a clone of the tokenizer registry the registry was built with,
+    /// if any. Used by the policy/router factory paths that build `cache_aware`
+    /// policies (prefill / decode policies in PD mode).
+    pub fn tokenizer_registry(&self) -> Option<Arc<TokenizerRegistry>> {
+        self.tokenizer_registry.clone()
     }
 
     /// Set mesh sync manager (thread-safe, can be called after initialization)
@@ -182,9 +215,21 @@ impl PolicyRegistry {
         Arc::clone(&self.default_policy)
     }
 
-    /// Create a policy from a type string (delegates to PolicyFactory)
+    /// Create a policy from a type string (delegates to PolicyFactory).
+    ///
+    /// Note: this path produces a [`CacheAwarePolicy`] (mesh-style) without
+    /// regard to the global `sync_mode` config. The Zmq variant requires
+    /// the full `CacheAwareConfig` (block_size, event_port, etc.) — when a
+    /// worker hint just says "cache_aware", we pick the legacy variant and
+    /// log so operators can switch to a config-driven policy if they want
+    /// the ZMQ indexer.
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         if policy_type == "cache_aware" {
+            debug!(
+                "creating legacy mesh-mode CacheAwarePolicy from worker hint; \
+                 set policy in config (PolicyConfig::CacheAware) with sync_mode=zmq \
+                 to use the ZMQ indexer instead"
+            );
             let mut cache_aware = CacheAwarePolicy::new();
             let mesh_sync = &*self.mesh_sync.read().unwrap();
             cache_aware.set_mesh_sync(mesh_sync.clone());
@@ -195,11 +240,6 @@ impl PolicyRegistry {
                 Arc::clone(&self.default_policy)
             })
         }
-    }
-
-    /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
-    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_from_config(config)
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)
@@ -294,78 +334,131 @@ impl PolicyRegistry {
         power_of_two_policies
     }
 
-    /// Initialize cache-aware policy with workers if applicable
-    /// This should be called after workers are registered for a model
-    pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
+    /// Initialize cache-aware policy with workers if applicable.
+    ///
+    /// Handles both the legacy `cache_aware` (mesh-style) policy and the
+    /// new `cache_aware_zmq` policy. For the ZMQ variant the call is
+    /// async because subscriber registration awaits I/O.
+    pub async fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+            match policy.name() {
+                "cache_aware" => {
+                    if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                        debug!(
+                            "Initializing cache-aware policy with {} workers for model {}",
+                            workers.len(),
+                            model_id
+                        );
+                        cache_aware.init_workers(workers);
+                    }
+                }
+                "cache_aware_zmq" => {
                     debug!(
-                        "Initializing cache-aware policy with {} workers for model {}",
+                        "Initializing cache-aware-zmq policy with {} workers for model {}",
                         workers.len(),
                         model_id
                     );
-                    cache_aware.init_workers(workers);
+                    for worker in workers {
+                        policy.on_add_worker(worker.as_ref()).await;
+                    }
                 }
+                _ => {}
             }
         }
     }
 
-    /// Remove a worker from cache-aware policy if applicable
-    /// This should be called when a worker is being removed
-    pub fn remove_worker_from_cache_aware(&self, model_id: &str, worker_url: &str) {
-        // Get the policy for this model
+    /// Remove a worker from cache-aware policy if applicable.
+    ///
+    /// Handles both `cache_aware` and `cache_aware_zmq` policies. The ZMQ
+    /// path needs the full `Worker` (for dp_size lookup at unsubscribe
+    /// time); the mesh path only needs the URL, which we forward to the
+    /// existing `remove_worker_by_url` for backward compatibility.
+    pub async fn remove_worker_from_cache_aware(
+        &self,
+        model_id: &str,
+        worker_url: &str,
+        worker: Option<&dyn Worker>,
+    ) {
         if let Some(policy) = self.get_policy(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    debug!(
-                        "Removed worker {} from cache-aware policy for model {}",
-                        worker_url, model_id
-                    );
+            match policy.name() {
+                "cache_aware" => {
+                    if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                        cache_aware.remove_worker_by_url(worker_url);
+                        debug!(
+                            "Removed worker {} from cache-aware policy for model {}",
+                            worker_url, model_id
+                        );
+                    }
                 }
+                "cache_aware_zmq" => {
+                    if let Some(w) = worker {
+                        policy.on_remove_worker(w).await;
+                        debug!(
+                            "Removed worker {} from cache-aware-zmq policy for model {}",
+                            worker_url, model_id
+                        );
+                    } else {
+                        warn!(
+                            "Cannot remove worker {} from cache_aware_zmq policy for model {}: \
+                             URL-only removal is not supported (need Worker for dp_size). Skipping.",
+                            worker_url, model_id
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
-    pub fn init_pd_cache_aware_policies(
+    /// Initialize cache-aware policies for PD mode (prefill and decode).
+    ///
+    /// Async to support the `cache_aware_zmq` variant; mesh-style policies
+    /// resolve immediately.
+    pub async fn init_pd_cache_aware_policies(
         &self,
         prefill_workers: &[Arc<dyn Worker>],
         decode_workers: &[Arc<dyn Worker>],
     ) {
-        // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "cache_aware" {
-                if let Some(cache_aware) =
-                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
-                    if !prefill_workers.is_empty() {
-                        debug!(
-                            "Initializing prefill cache-aware policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        cache_aware.init_workers(prefill_workers);
-                    }
-                }
-            }
+            Self::seed_cache_aware_policy(prefill_policy, prefill_workers, "prefill").await;
         }
 
-        // Initialize decode policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(decode_policy) = self.decode_policy.get() {
-            if decode_policy.name() == "cache_aware" {
-                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
-                    if !decode_workers.is_empty() {
-                        debug!(
-                            "Initializing decode cache-aware policy with {} workers",
-                            decode_workers.len()
-                        );
-                        cache_aware.init_workers(decode_workers);
-                    }
+            Self::seed_cache_aware_policy(decode_policy, decode_workers, "decode").await;
+        }
+    }
+
+    async fn seed_cache_aware_policy(
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        role: &str,
+    ) {
+        if workers.is_empty() {
+            return;
+        }
+        match policy.name() {
+            "cache_aware" => {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    debug!(
+                        "Initializing {} cache-aware policy with {} workers",
+                        role,
+                        workers.len()
+                    );
+                    cache_aware.init_workers(workers);
                 }
             }
+            "cache_aware_zmq" => {
+                debug!(
+                    "Initializing {} cache-aware-zmq policy with {} workers",
+                    role,
+                    workers.len()
+                );
+                for worker in workers {
+                    policy.on_add_worker(worker.as_ref()).await;
+                }
+            }
+            _ => {}
         }
     }
 

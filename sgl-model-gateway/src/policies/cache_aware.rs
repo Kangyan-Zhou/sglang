@@ -496,6 +496,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true // Cache-aware policy needs request text for cache affinity
     }
 
+    async fn on_add_worker(&self, worker: &dyn Worker) {
+        // Mesh-style cache-aware policy uses synchronous tree insertion;
+        // forward to the inherent method.
+        self.add_worker(worker);
+    }
+
+    async fn on_remove_worker(&self, worker: &dyn Worker) {
+        self.remove_worker(worker);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
