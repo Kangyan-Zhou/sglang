@@ -14,6 +14,7 @@ mod bucket;
 mod cache_aware;
 mod consistent_hashing;
 mod factory;
+pub mod kv_events;
 mod manual;
 mod power_of_two;
 mod prefix_hash;
