@@ -562,12 +562,33 @@ impl LoadBalancingPolicy for CacheAwareZmqPolicy {
         let matched = tree.match_prefix(None, &block_hashes);
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
 
+        // DEBUG: log the tree-match decision so we can verify cache-aware
+        // routing end-to-end. Remove or downgrade to trace once stable.
+        debug!(
+            model = %model_id,
+            tree_node_count = tree.node_count(),
+            n_blocks = block_hashes.len(),
+            first_3_hashes = ?block_hashes.iter().take(3).copied().collect::<Vec<_>>(),
+            matched_blocks = matched.matched_blocks,
+            match_rate,
+            matched_workers = ?matched.workers.iter().map(|w| (w.url.clone(), w.dp_rank)).collect::<Vec<_>>(),
+            cache_threshold = self.config.cache_threshold,
+            "cache-aware-zmq match_prefix result"
+        );
+
         let chosen = if match_rate > self.config.cache_threshold {
             Self::pick_matched_worker(workers, &healthy_indices, &matched)
         } else {
             None
         }
         .or_else(|| Self::pick_min_load(workers, &healthy_indices))?;
+
+        debug!(
+            model = %model_id,
+            chosen_url = %workers[chosen].url(),
+            chosen_load = workers[chosen].load(),
+            "cache-aware-zmq select_worker chose"
+        );
 
         workers[chosen].increment_processed();
         Some(chosen)
@@ -704,6 +725,14 @@ fn apply_event_to_trees(
     for event in batch.events {
         match event {
             KvCacheEvent::BlockStored(stored) => {
+                debug!(
+                    worker_url = %worker.url,
+                    dp_rank = worker.dp_rank,
+                    parent = ?stored.parent_block_hash,
+                    n_hashes = stored.block_hashes.len(),
+                    first_hashes = ?stored.block_hashes.iter().take(3).copied().collect::<Vec<_>>(),
+                    "applying BlockStored to tree"
+                );
                 tree.insert(&worker, stored.parent_block_hash, &stored.block_hashes);
             }
             KvCacheEvent::BlockRemoved(removed) => {
