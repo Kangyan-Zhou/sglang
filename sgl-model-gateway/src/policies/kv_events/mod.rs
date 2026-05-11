@@ -9,10 +9,12 @@
 //! `array_like=True, omit_defaults=True, gc=False, tag=True`) and the
 //! gateway-side indexer.
 
+pub mod discovery;
 pub mod hash;
 pub mod tree;
 pub mod wire;
 
+pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, sha256_to_i64};
 pub use tree::{HashTree, KvWorkerId, MatchResult};
 pub use wire::{
