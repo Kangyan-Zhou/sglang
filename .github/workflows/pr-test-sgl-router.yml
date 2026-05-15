@@ -206,7 +206,7 @@ jobs:
           exit 0
 
   sgl-router-k8s-integration:
-    name: tier-3 — k8s integration (placeholder)
+    name: tier-3 — k8s integration
     needs: sgl-router-build-and-test
     if: |
       github.event_name != 'pull_request' ||
@@ -215,10 +215,35 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - name: Placeholder
+      - uses: actions/checkout@v4
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Install kind
         run: |
-          echo "k8s-integration not implemented yet."
-          exit 0
+          curl -Lo /tmp/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x /tmp/kind && sudo mv /tmp/kind /usr/local/bin/kind
+      - name: Install kubectl
+        run: |
+          curl -Lo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl
+      - name: Build router image
+        run: docker build -t sgl-router:e2e -f experimental/sgl-router/e2e/k8s_integration/Dockerfile.router .
+      - name: Build fake_worker image
+        run: |
+          docker build -t sgl-router-fake-worker:e2e \
+            -f experimental/sgl-router/e2e/k8s_integration/Dockerfile.fake_worker \
+            experimental/sgl-router/e2e/k8s_integration/
+      - name: Bootstrap kind + deploy
+        run: bash experimental/sgl-router/e2e/k8s_integration/setup.sh
+      - name: Set up Python
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install -r experimental/sgl-router/e2e/k8s_integration/requirements.txt
+      - name: Run E2E
+        run: /tmp/e2e-venv/bin/pytest experimental/sgl-router/e2e/k8s_integration/ -v --tb=short
+      - name: Dump router logs on failure
+        if: failure()
+        run: kubectl -n sgl-router-test logs deploy/sgl-router --tail=200 || true
 
   sgl-router-e2e:
     name: tier-3 — e2e
