@@ -104,9 +104,7 @@ jobs:
           rustup toolchain install nightly --profile minimal --component rustfmt
           cargo +nightly fmt -- --check
 
-      # cargo-deny pinned to 0.19.6+ because 0.16 cannot parse CVSS 4.0 advisories.
-      # `cargo deny check advisories` is our CVE + yanked gate; cargo-audit was
-      # tried alongside but 0.21.2 also cannot parse CVSS 4.0 (RUSTSEC-2026-0073).
+      # cargo-deny 0.19.6+ required for CVSS 4.0 parsing.
       - name: Install cargo-deny
         run: cargo install --locked cargo-deny@0.19.6
 
@@ -202,9 +200,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Placeholder — populated in M6
+      - name: Placeholder
         run: |
-          echo "docker-build-test placeholder. To be populated in M6 (Observability + Docker)."
+          echo "docker-build-test not implemented yet."
           exit 0
 
   sgl-router-k8s-integration:
@@ -217,9 +215,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - name: Placeholder — populated in M2
+      - name: Placeholder
         run: |
-          echo "k8s-integration placeholder. To be populated in M2 (Service discovery)."
+          echo "k8s-integration not implemented yet."
           exit 0
 
   sgl-router-e2e:
