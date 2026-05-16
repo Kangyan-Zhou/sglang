@@ -231,6 +231,18 @@ jobs:
       - sgl-router-docker-build-test
       - sgl-router-k8s-integration
       - sgl-router-e2e
+    # Gate finish on the same label as upstream jobs to avoid false-green on
+    # unlabeled PRs (skipped needs => success), and fail when any upstream
+    # job actually failed or was cancelled.
+    if: |
+      always() &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      (
+        github.event_name != 'pull_request' ||
+        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+        (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+      )
     runs-on: ubuntu-latest
     steps:
       - name: All required checks completed
