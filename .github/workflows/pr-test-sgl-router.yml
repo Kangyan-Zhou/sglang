@@ -187,9 +187,15 @@ jobs:
       # drifted from the script, OR the script drifted from SGLang's actual
       # code — in both cases the operator must investigate and re-commit
       # the fixture in the same PR as the algorithm change.
+      #
+      # `set -euo pipefail` makes a Python-side failure (syntax error,
+      # missing import) cause this step to fail instead of falling
+      # through to a no-diff "pass" when no fixture was actually
+      # regenerated.
       - name: kv_events hash parity fixture (drift check)
         working-directory: experimental/sgl-router
         run: |
+          set -euo pipefail
           python3 tests/scripts/generate_kv_events_hash_parity.py
           if ! git diff --exit-code -- tests/fixtures/kv_events_hash_parity.json; then
             echo "::error::kv_events hash parity fixture drifted." \
