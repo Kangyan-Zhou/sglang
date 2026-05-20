@@ -251,20 +251,20 @@ jobs:
           curl -Lo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
           chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl
       - name: Build router image
-        run: docker build -t sgl-router:e2e -f experimental/sgl-router/e2e/k8s_integration/Dockerfile.router .
+        run: docker build -t sgl-router:e2e -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.router .
       - name: Build fake_worker image
         run: |
           docker build -t sgl-router-fake-worker:e2e \
-            -f experimental/sgl-router/e2e/k8s_integration/Dockerfile.fake_worker \
-            experimental/sgl-router/e2e/k8s_integration/
+            -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.fake_worker \
+            experimental/sgl-router/tests/e2e/k8s_integration/
       - name: Bootstrap kind + deploy
-        run: bash experimental/sgl-router/e2e/k8s_integration/setup.sh
+        run: bash experimental/sgl-router/tests/e2e/k8s_integration/setup.sh
       - name: Set up Python
         run: |
           python3 -m venv /tmp/e2e-venv
-          /tmp/e2e-venv/bin/pip install -r experimental/sgl-router/e2e/k8s_integration/requirements.txt
+          /tmp/e2e-venv/bin/pip install -r experimental/sgl-router/tests/e2e/k8s_integration/requirements.txt
       - name: Run E2E
-        run: /tmp/e2e-venv/bin/pytest experimental/sgl-router/e2e/k8s_integration/ -v --tb=short
+        run: /tmp/e2e-venv/bin/pytest experimental/sgl-router/tests/e2e/k8s_integration/ -v --tb=short
       - name: Dump router logs on failure
         if: failure()
         run: kubectl -n sgl-router-test logs deploy/sgl-router --tail=200 || true
@@ -291,13 +291,13 @@ jobs:
       - name: Set up Python
         run: |
           python3 -m venv /tmp/sgl-router-e2e-venv
-          /tmp/sgl-router-e2e-venv/bin/pip install -r experimental/sgl-router/e2e/requirements.txt
+          /tmp/sgl-router-e2e-venv/bin/pip install -r experimental/sgl-router/tests/e2e/requirements.txt
           /tmp/sgl-router-e2e-venv/bin/pip install "sglang[srt]==0.4.5"
       - name: Run e2e
         working-directory: experimental/sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: /tmp/sgl-router-e2e-venv/bin/pytest e2e/ -v -s --tb=short
+        run: /tmp/sgl-router-e2e-venv/bin/pytest tests/e2e/ -v -s --tb=short
 
       - name: Tokenizer parity matrix (uses HF cache populated by e2e)
         working-directory: experimental/sgl-router
@@ -306,7 +306,7 @@ jobs:
         # Runs after pytest so the Qwen3-0.6B tokenizer.json is cached by the
         # SGLang worker. Cells without a cached snapshot are skipped; if no
         # cells could be checked, the test hard-fails under SGLANG_IS_IN_CI.
-        run: cargo test --release --test tokenizer_parity_test
+        run: cargo test --release --test component tokenizer::parity
 
   sgl-router-finish:
     name: finish
