@@ -260,6 +260,35 @@ class TestWithheldFieldReachesTheWire(CustomTestCase):
         finally:
             server_args.get_global_server_args = original
 
+    def test_post_init_wires_the_resolved_gate_onto_the_field(self):
+        # Everything else here either sets `_report_uncached_tokens` by hand or
+        # calls the predicate directly, so dropping the assignment in
+        # `__post_init__` would leave the field at its `False` default — the
+        # feature dead on every fleet, with this whole suite green.
+        #
+        # `publisher: "null"` makes `__post_init__` run the enable check and the
+        # gate, then return before binding any ZMQ socket.
+        import sglang.srt.server_args as server_args
+
+        original = server_args.get_global_server_args
+        server_args.get_global_server_args = lambda: types.SimpleNamespace(
+            schedule_policy="lpm", disable_radix_cache=False
+        )
+        try:
+            pub = SchedulerLoadPublisher(
+                kv_events_config='{"publisher": "null"}',
+                ps=types.SimpleNamespace(
+                    attn_tp_rank=0, attn_cp_rank=0, attn_dp_rank=0
+                ),
+                dp_size=1,
+            )
+            self.assertTrue(
+                pub._report_uncached_tokens,
+                "__post_init__ must carry the resolved gate onto the field",
+            )
+        finally:
+            server_args.get_global_server_args = original
+
     def test_unresolvable_policy_withholds(self):
         # The except path exists so a startup-order surprise can't turn into a
         # published number in the wrong unit. Force it by breaking the lookup.
