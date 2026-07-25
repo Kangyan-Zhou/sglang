@@ -84,14 +84,18 @@ pub struct Cli {
     #[arg(long)]
     pub cb_cool_down_secs: Option<u64>,
 
-    // ---- cache-aware-zmq tuning (only used by that policy) ----
+    // ---- cache-aware-zmq tuning (--cache-threshold requires that policy; the
+    // two deprecated flags below are accepted under any policy and ignored) ----
     /// Min `matched_blocks / total_blocks` for a cache match to win.
     #[arg(long)]
     pub cache_threshold: Option<f32>,
-    /// Absolute load spread above which the cache check is skipped.
+    /// DEPRECATED, ignored. Cache-aware routing no longer gates on a fleet-wide
+    /// load spread; the rotation decision compares the cache candidate's queued
+    /// prefill against the least-backlogged worker's, in tokens. Still parsed so
+    /// a deployment passing it keeps starting; a warning is logged.
     #[arg(long)]
     pub balance_abs_threshold: Option<usize>,
-    /// Multiplicative load spread gating the absolute balance check.
+    /// DEPRECATED, ignored. See `--balance-abs-threshold`.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
 
@@ -254,6 +258,30 @@ impl Cli {
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
 
+        // Warn rather than reject: these two no longer map to anything, but an
+        // existing deployment passing them must keep starting. (Contrast the
+        // reject-unused-knob check below, which applies to flags that still do
+        // something under some other policy.)
+        for (flag, set) in [
+            (
+                "--balance-abs-threshold",
+                self.balance_abs_threshold.is_some(),
+            ),
+            (
+                "--balance-rel-threshold",
+                self.balance_rel_threshold.is_some(),
+            ),
+        ] {
+            if set {
+                tracing::warn!(
+                    "{flag} is ignored: cache-aware routing no longer gates on a \
+                     fleet-wide load spread. Rotation compares the cache \
+                     candidate's queued prefill against the least-backlogged \
+                     worker's, in tokens, with no threshold to set."
+                );
+            }
+        }
+
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
         // checks. Otherwise an operator believes they tuned something that has
@@ -264,13 +292,10 @@ impl Cli {
                  enabled by --cb-threshold)"
             ));
         }
-        let tuned_cache_aware = self.cache_threshold.is_some()
-            || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some();
+        let tuned_cache_aware = self.cache_threshold.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
-                 require --policy cache_aware_zmq"
+                "--cache-threshold requires --policy cache_aware_zmq"
             ));
         }
 
@@ -360,12 +385,6 @@ impl Cli {
             let d = CacheAwareConfig::default();
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
-                balance_abs_threshold: self
-                    .balance_abs_threshold
-                    .unwrap_or(d.balance_abs_threshold),
-                balance_rel_threshold: self
-                    .balance_rel_threshold
-                    .unwrap_or(d.balance_rel_threshold),
             })
         } else {
             None
@@ -1033,8 +1052,6 @@ mod tests {
         .unwrap();
         let ca = c.model.cache_aware.expect("cache_aware set");
         assert_eq!(ca.cache_threshold, 0.7);
-        // Untouched knobs fall back to defaults.
-        assert_eq!(ca.balance_abs_threshold, 32);
     }
 
     #[test]
@@ -1062,9 +1079,57 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("require --policy cache_aware_zmq"),
+            err.contains("requires --policy cache_aware_zmq"),
             "got: {err}"
         );
+
+        // A match rate is a ratio, so a percent slip (50 for "50%") or a sign
+        // error must fail at startup rather than silently disabling cache routing.
+        for bad in [
+            "--cache-threshold=50",
+            "--cache-threshold=1.5",
+            "--cache-threshold=-0.5",
+            "--cache-threshold=NaN",
+        ] {
+            assert!(
+                into_config_owned(with_model(&[
+                    "--worker-urls",
+                    "http://x:30000",
+                    "--policy",
+                    "cache_aware_zmq",
+                    bad,
+                ]))
+                .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+
+        // Both ENDS of the range stay legal, and each has a purpose the rejection
+        // list above would happily narrow away: 1.0 is observe-only (the comparison
+        // is strict, so the predicted rate is still reported while routing never
+        // acts on it), and 0.0 routes on any match at all.
+        for good in ["--cache-threshold=0", "--cache-threshold=1"] {
+            into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                "cache_aware_zmq",
+                good,
+            ]))
+            .unwrap_or_else(|e| panic!("{good} must be accepted, got: {e}"));
+        }
+
+        // The two deprecated knobs take the opposite path: accepted so a
+        // deployment passing them keeps starting, warned about, and never
+        // reaching a config.
+        for flag in ["--balance-abs-threshold=32", "--balance-rel-threshold=1.1"] {
+            let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000", flag]))
+                .expect("deprecated knobs must not fail startup");
+            assert!(
+                c.model.cache_aware.is_none(),
+                "an ignored knob must not construct a cache-aware config",
+            );
+        }
     }
 
     #[test]

@@ -554,6 +554,7 @@ mod tests {
                 num_waiting_reqs: 4,
                 num_tokens: 0,
                 max_total_num_tokens: 0,
+                pending_prefill_tokens: None,
             },
         })
         .await
@@ -818,6 +819,7 @@ mod tests {
                 num_waiting_reqs: 1,
                 num_tokens: 0,
                 max_total_num_tokens: 0,
+                pending_prefill_tokens: None,
             },
             now,
         );

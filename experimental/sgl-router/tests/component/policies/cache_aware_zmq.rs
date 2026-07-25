@@ -114,8 +114,6 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     let policy = CacheAwareZmqPolicy::new(
         CacheAwareConfig {
             cache_threshold: 0.0,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
         },
         kv_index.tree(),
         Arc::clone(&tokenizers),
@@ -154,8 +152,9 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         .expect("send block-stored event");
 
     // 7. Bump worker B's load so the tie-break picks A among matched
-    //    workers. The bump stays below balance_abs_threshold so the
-    //    imbalance fast-path does not skip cache-aware selection.
+    //    workers. Router-side load never diverts a cached request on its own
+    //    (only a reported prefill-token backlog can, and neither engine here
+    //    reports one), so the bump only orders the matched set.
     //    Bind the guards to a Vec held for the rest of the test scope
     //    so the counter stays > 0 through the polling loop.
     let w_a = build_worker(url_a, "tiny");

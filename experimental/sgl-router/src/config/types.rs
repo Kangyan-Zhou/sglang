@@ -358,34 +358,18 @@ pub struct CacheAwareConfig {
     /// signal but not so weak that random hash collisions could trigger
     /// affinity to an arbitrary worker.
     pub cache_threshold: f32,
-    /// Absolute load spread (`max - min`) above which the cache check is
-    /// skipped in favour of min-load. Default 32 — picked to dominate
-    /// over typical batch-of-8 effect.
-    pub balance_abs_threshold: usize,
-    /// Multiplicative load spread (`max > min * balance_rel_threshold`)
-    /// that the absolute check is gated on. Default 1.1 — 10 % relative
-    /// difference triggers re-balancing.
-    pub balance_rel_threshold: f32,
 }
 
 impl Default for CacheAwareConfig {
     fn default() -> Self {
         Self {
             cache_threshold: default_cache_threshold(),
-            balance_abs_threshold: default_balance_abs(),
-            balance_rel_threshold: default_balance_rel(),
         }
     }
 }
 
 fn default_cache_threshold() -> f32 {
     0.5
-}
-fn default_balance_abs() -> usize {
-    32
-}
-fn default_balance_rel() -> f32 {
-    1.1
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix

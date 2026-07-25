@@ -27,6 +27,8 @@
 //! | `sgl_router_itl_seconds` | Histogram | `model_id` |
 //! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
+//! | `sgl_router_prompt_blocks_total` | Counter | `model_id` |
+//! | `sgl_router_expected_hit_rate` | Histogram | `model_id` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
@@ -66,6 +68,16 @@ use std::sync::Arc;
 /// 8000.
 const OVERLAP_BLOCKS_BUCKETS: &[f64] = &[
     0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0, 2000.0, 4000.0, 8000.0,
+];
+
+/// Histogram bucket upper bounds for `sgl_router_expected_hit_rate` — the
+/// router's own radix-tree prefix hit rate (matched blocks / total blocks), a
+/// fraction in [0, 1] observed once per scored cache-aware selection. Finer
+/// resolution near the top (0.95, 0.99) because a well-cached workload piles up
+/// against 1.0 and the question there is "how close to a full hit"; coarse 0.1
+/// steps would dump all of it into the last bucket.
+const EXPECTED_HIT_RATE_BUCKETS: &[f64] = &[
+    0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0,
 ];
 
 /// Histogram bucket upper bounds (seconds) for
@@ -348,6 +360,23 @@ pub struct MetricsRegistry {
     // CatchPanicLayer-synthesized 500).
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    /// Total prompt blocks summed over scored cache-aware-zmq selections, per
+    /// model. Companion denominator to `overlap_blocks` (whose histogram `_sum`
+    /// is the matched-block count), so
+    /// `rate(sgl_router_overlap_blocks_sum) / rate(sgl_router_prompt_blocks_total)`
+    /// is the block-weighted expected hit rate — the Prometheus analogue of the
+    /// window mean in `cache_aware_zmq::HitRateWindow::mean_rate`, which documents
+    /// the weighting and why it only approximates the engine's
+    /// `sglang_cached_tokens / sglang_prompt_tokens`.
+    prompt_blocks_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    /// Router-side expected prefix cache-hit rate (matched blocks / total
+    /// blocks) observed at cache-aware-zmq selection, per model. This is the
+    /// router's *prediction* from its own KV-event radix tree — not a measured
+    /// engine hit — recorded for every scored selection including the ones that
+    /// fall below `cache_threshold` and route to min-load, so the distribution
+    /// shows how much reusable prefix the router is actually finding. Companion
+    /// to `overlap_blocks` (the raw count); this is the normalized rate.
+    expected_hit_rate: Mutex<HashMap<String, Histogram>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -417,6 +446,8 @@ impl Default for MetricsRegistry {
             itl_seconds: Default::default(),
             responses_total: Default::default(),
             overlap_blocks: Default::default(),
+            prompt_blocks_total: Default::default(),
+            expected_hit_rate: Default::default(),
             active_load: Default::default(),
             stale_requests_total: Default::default(),
             decode_affinity_total: Default::default(),
@@ -593,6 +624,31 @@ impl MetricsRegistry {
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
         hist.observe(blocks as f64);
+    }
+
+    /// Add `n_blocks` total prompt blocks to `sgl_router_prompt_blocks_total` —
+    /// the companion denominator to `observe_overlap_blocks`, recorded on the
+    /// same scored path, once per selection. See the `prompt_blocks_total` field
+    /// doc for the PromQL ratio.
+    pub fn observe_prompt_blocks(&self, model_id: &str, n_blocks: u64) {
+        let mut guard = self.prompt_blocks_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(n_blocks, Ordering::Relaxed);
+    }
+
+    /// Observe the router's expected prefix hit rate (0..1) for
+    /// `sgl_router_expected_hit_rate`. See the field doc for what this rate
+    /// means (a radix-tree prediction, not a measured engine hit).
+    pub fn observe_expected_hit_rate(&self, model_id: &str, rate: f64) {
+        let mut guard = self.expected_hit_rate.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(EXPECTED_HIT_RATE_BUCKETS));
+        hist.observe(rate);
     }
 
     /// Observe end-to-end request latency (seconds) for
@@ -1139,6 +1195,42 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // prompt_blocks_total — denominator for the token/block-weighted hit
+        // rate: rate(sgl_router_overlap_blocks_sum) / rate(this).
+        out.push_str(
+            "# HELP sgl_router_prompt_blocks_total Total prompt blocks summed over scored cache-aware-zmq selections; denominator for the token/block-weighted expected hit rate (overlap_blocks_sum / this).\n",
+        );
+        out.push_str("# TYPE sgl_router_prompt_blocks_total counter\n");
+        let guard = self.prompt_blocks_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_prompt_blocks_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // expected_hit_rate histogram
+        out.push_str(
+            "# HELP sgl_router_expected_hit_rate Router-side expected prefix cache-hit rate (matched blocks / total blocks) predicted from the KV-event radix tree at cache-aware-zmq selection.\n",
+        );
+        out.push_str("# TYPE sgl_router_expected_hit_rate histogram\n");
+        let guard = self.expected_hit_rate.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(&mut out, "sgl_router_expected_hit_rate", &label_body, hist);
+        }
+        drop(guard);
+
         // active_load gauge
         out.push_str(
             "# HELP sgl_router_active_load Per-worker active load (prefill_tokens or decode_blocks).\n",
@@ -1551,6 +1643,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_ttft_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_responses_total counter"));
         assert!(out.contains("# TYPE sgl_router_overlap_blocks histogram"));
+        assert!(out.contains("# TYPE sgl_router_prompt_blocks_total counter"));
         assert!(out.contains("# TYPE sgl_router_active_load gauge"));
         assert!(out.contains("# TYPE sgl_router_workers gauge"));
         assert!(out.contains("# TYPE sgl_router_worker_health gauge"));
@@ -1758,6 +1851,37 @@ mod tests {
         );
         // le=0.2 (an engine-aligned edge) is cumulative over both observations.
         assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.2"} 2"#));
+    }
+
+    #[test]
+    fn observe_expected_hit_rate_writes_buckets_sum_and_count() {
+        let reg = MetricsRegistry::new();
+        reg.observe_expected_hit_rate("tiny", 0.8);
+        reg.observe_expected_hit_rate("tiny", 1.0);
+        let out = reg.render();
+        assert!(
+            out.contains("# TYPE sgl_router_expected_hit_rate histogram"),
+            "expected TYPE header; got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_expected_hit_rate_count{model_id="tiny"} 2"#),
+            "expected count=2; got:\n{out}",
+        );
+        // 0.8 <= 0.8, so the le=0.8 bucket is 1 (cumulative); 1.0 sits above it.
+        assert!(
+            out.contains(r#"sgl_router_expected_hit_rate_bucket{model_id="tiny",le="0.8"} 1"#),
+            "expected le=0.8 bucket = 1; got:\n{out}",
+        );
+        // le=1 (the top edge) catches both observations.
+        assert!(
+            out.contains(r#"sgl_router_expected_hit_rate_bucket{model_id="tiny",le="1"} 2"#),
+            "expected le=1 bucket = 2; got:\n{out}",
+        );
+        // sum = 0.8 + 1.0.
+        assert!(
+            out.contains(r#"sgl_router_expected_hit_rate_sum{model_id="tiny"} 1.8"#),
+            "expected sum = 1.8; got:\n{out}",
+        );
     }
 
     #[test]
@@ -2005,6 +2129,37 @@ mod tests {
         assert!(
             out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="4"} 1"#),
             "bucket le=4 should be 1; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn observe_prompt_blocks_accumulates_and_pairs_with_overlap_sum() {
+        let reg = MetricsRegistry::new();
+        // Two scored selections: (matched=1, total=4) and (matched=9, total=10).
+        reg.observe_overlap_blocks("tiny", 1);
+        reg.observe_prompt_blocks("tiny", 4);
+        reg.observe_overlap_blocks("tiny", 9);
+        reg.observe_prompt_blocks("tiny", 10);
+        // A second model is tracked independently.
+        reg.observe_prompt_blocks("other", 7);
+        let out = reg.render();
+
+        assert!(out.contains("# TYPE sgl_router_prompt_blocks_total counter"));
+        // Total prompt blocks = 4 + 10 = 14, the weighted-hit-rate denominator.
+        assert!(
+            out.contains(r#"sgl_router_prompt_blocks_total{model_id="tiny"} 14"#),
+            "prompt-blocks counter should sum to 14; got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_prompt_blocks_total{model_id="other"} 7"#),
+            "per-model split; got:\n{out}",
+        );
+        // overlap_blocks_sum = 1 + 9 = 10 (matched). The token/block-weighted
+        // hit rate is 10/14 ≈ 0.714, NOT the request-weighted mean of
+        // (0.25 + 0.9)/2 = 0.575 — the point of exposing both series.
+        assert!(
+            out.contains(r#"sgl_router_overlap_blocks_sum{model_id="tiny"} 10"#),
+            "overlap sum (matched blocks) should be 10; got:\n{out}",
         );
     }
 

@@ -27,7 +27,8 @@ The dashboard graphs every family the router emits:
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
 | `sgl_router_itl_seconds` | Histogram | Inter-token latency (gap between successive upstream chunks, 2xx streaming) by `model_id`; bucket edges match the engine's `sglang:inter_token_latency_seconds` |
-| `sgl_router_overlap_blocks` | Histogram | Cache-aware-zmq overlap blocks by `model_id` |
+| `sgl_router_overlap_blocks` | Histogram | Cache-aware-zmq matched (overlap) blocks per scored selection by `model_id` |
+| `sgl_router_prompt_blocks_total` | Counter | Total prompt blocks over scored cache-aware-zmq selections by `model_id`. Denominator for the block-weighted expected hit rate: `rate(sgl_router_overlap_blocks_sum) / rate(sgl_router_prompt_blocks_total)` — the router-side analogue of the engine's `sglang_cached_tokens / sglang_prompt_tokens` |
 | `sgl_router_active_load` | Gauge | Per-worker prefill-token / decode-block load |
 | `sgl_router_workers` | Gauge | Registered worker count by `mode` |
 | `sgl_router_worker_health` | Gauge | Per-worker health (1=breaker admits, 0=open) |

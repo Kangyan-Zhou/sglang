@@ -78,6 +78,35 @@ impl Config {
                 ));
             }
         }
+        // `cache_threshold` is a ratio in [0, 1]. Out of range it fails silently at
+        // REQUEST time rather than at startup, and NaN is the worst case: both
+        // `match_rate > NaN` and `match_rate <= NaN` are false, so cache routing is
+        // off AND every request reports the `no_live_matched_worker` reason — which
+        // points an on-call reader at worker health when the real cause is the
+        // threshold. 1.0 stays legal and useful: the comparison is strict, so it is
+        // observe-only — the predicted hit rate is still reported, routing just
+        // doesn't act on it.
+        //
+        // Read through `unwrap_or_default`: `cache_aware` is `None` whenever no
+        // cache knob was passed, and the policy then runs on exactly this default
+        // (see `policies::factory`), so the check has to cover the default too.
+        {
+            let ca = self.model.cache_aware.unwrap_or_default();
+            if !ca.cache_threshold.is_finite() {
+                return Err(anyhow!(
+                    "--cache-threshold must be finite; got {}",
+                    ca.cache_threshold
+                ));
+            }
+            if !(0.0..=1.0).contains(&ca.cache_threshold) {
+                return Err(anyhow!(
+                    "--cache-threshold must be in [0, 1] (the comparison is strict, \
+                     so 1.0 disables routing by cache while still reporting the \
+                     predicted hit rate); got {}",
+                    ca.cache_threshold
+                ));
+            }
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {

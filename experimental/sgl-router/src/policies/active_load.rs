@@ -172,12 +172,15 @@ impl Clock for MockClock {
 
 /// Registry of in-flight requests + per-worker active-load counters.
 ///
-/// Constructed once per `AppContext`; the cache-aware-zmq policy reads
-/// per-worker `prefill_load` / `decode_load` from here when scoring
-/// candidates, and the proxy holds an [`ActiveLoadGuard`] per request so
-/// counters decrement on drop. A background task periodically calls
-/// [`Self::sweep_stale`] to evict requests that outlived
+/// Constructed once per `AppContext`. The proxy holds an [`ActiveLoadGuard`] per
+/// request so counters decrement on drop, and a background task periodically
+/// calls [`Self::sweep_stale`] to evict requests that outlived
 /// `stale_request_timeout`.
+///
+/// The per-worker `prefill_load` / `decode_load` totals are an observability
+/// signal only — they feed the `sgl_router_active_load` gauge and have no
+/// in-crate callers outside this module. Routing policies read the
+/// request-count counter on `Worker` (`Worker::active_load`), not these.
 #[derive(Debug)]
 pub struct ActiveLoadRegistry {
     workers: DashMap<WorkerId, Arc<WorkerCounters>>,
