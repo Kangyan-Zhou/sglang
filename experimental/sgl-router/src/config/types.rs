@@ -439,6 +439,41 @@ pub enum LoadGate {
     /// The gate fails open and says so, rather than comparing the threshold
     /// against a different quantity.
     PerWorkerQueue(NonZeroUsize),
+    /// Score every candidate by estimated seconds-to-first-token and take the
+    /// cheapest:
+    ///
+    /// ```text
+    /// cost(w) = uncached_tokens(w) / prefill_tokens_per_sec
+    ///         + waiting(w) * mean_service_secs
+    /// ```
+    ///
+    /// Where [`Self::PerWorkerQueue`] answers "is this worker queueing, yes or
+    /// no", this asks how much the queue actually costs relative to the prefill
+    /// it saves — so a request whose cache home holds nearly all of its prompt
+    /// holds on through a queue that a barely-cached request would rightly flee.
+    /// The binary gate cannot express that: it treats a 95%-cached request and a
+    /// 21%-cached one identically.
+    ///
+    /// Both terms are seconds, which is the only reason they can be added. The
+    /// two constants are what make that conversion, and they are deployment
+    /// facts, not tuning knobs to sweep blindly:
+    ///
+    /// - `prefill_tokens_per_sec`: sustained prefill throughput of one engine.
+    /// - `mean_service_secs`: how long one queued request takes to clear, i.e.
+    ///   what each place in the queue costs the next arrival.
+    ///
+    /// Get them wrong in the same direction and the ranking is unchanged (both
+    /// terms scale together); get their RATIO wrong and this degrades toward
+    /// pure cache affinity (queue term too small) or pure least-queue routing
+    /// (too large). The ratio is the thing to calibrate.
+    ///
+    /// A worker with no fresh queue reading contributes no queue term — the same
+    /// fail-open rule the other strategies use, and for the same reason: there
+    /// is no per-worker router-side substitute for the engine's queue.
+    Cost {
+        prefill_tokens_per_sec: f32,
+        mean_service_secs: f32,
+    },
 }
 
 impl Default for LoadGate {
@@ -468,8 +503,31 @@ impl LoadGate {
     pub fn admits_affinity(&self, waiting: Option<usize>) -> bool {
         match (self, waiting) {
             (Self::PerWorkerQueue(limit), Some(waiting)) => waiting < limit.get(),
+            // `Cost` has no binary verdict to give: it ranks rather than
+            // filters, so every worker stays admissible and the ordering does
+            // the work.
             _ => true,
         }
+    }
+
+    /// Estimated seconds before this worker starts producing tokens, given the
+    /// prefix it already holds and the queue ahead of it. `None` under the
+    /// strategies that do not score.
+    ///
+    /// `uncached_tokens` is the caller's, because only it knows the prompt
+    /// length and this worker's overlap; `waiting` is `None` when no fresh
+    /// snapshot says, and contributes nothing rather than being guessed.
+    pub fn cost_secs(&self, uncached_tokens: usize, waiting: Option<usize>) -> Option<f64> {
+        let Self::Cost {
+            prefill_tokens_per_sec,
+            mean_service_secs,
+        } = self
+        else {
+            return None;
+        };
+        let prefill = uncached_tokens as f64 / f64::from(*prefill_tokens_per_sec);
+        let queue = waiting.unwrap_or(0) as f64 * f64::from(*mean_service_secs);
+        Some(prefill + queue)
     }
 
     /// The configured queue limit, or `None` under [`Self::FleetSpread`].
@@ -478,7 +536,7 @@ impl LoadGate {
     pub fn queue_limit(&self) -> Option<usize> {
         match self {
             Self::PerWorkerQueue(limit) => Some(limit.get()),
-            Self::FleetSpread { .. } => None,
+            Self::FleetSpread { .. } | Self::Cost { .. } => None,
         }
     }
 }

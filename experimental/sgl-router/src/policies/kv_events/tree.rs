@@ -176,6 +176,35 @@ pub struct MatchResult {
     pub workers: HashSet<KvWorkerId>,
 }
 
+/// Per-worker prefix overlap, for callers that score workers against each
+/// other rather than picking from the deepest node's owner set.
+///
+/// [`MatchResult`] answers "who holds the longest match"; this answers "how
+/// much does each worker hold", which is what a cost model needs — a worker
+/// that diverges a few blocks before the best one is nearly as good, and the
+/// owner set alone cannot say so.
+#[derive(Debug, Clone, Default)]
+pub struct ScoredMatch {
+    /// Longest prefix any worker holds, in blocks.
+    pub matched_blocks: usize,
+    /// Deepest matched block count per worker. Workers absent from the map
+    /// matched fewer than `matched_blocks - PER_WORKER_CLIMB_LEVELS` blocks and
+    /// are to be read as 0 — see [`PER_WORKER_CLIMB_LEVELS`].
+    pub per_worker_blocks: FxHashMap<KvWorkerId, usize>,
+}
+
+/// How far back up the matched path [`HashTree::match_prefix_scored`] collects
+/// per-worker depths.
+///
+/// The walk is bounded because owner-set size grows toward the root — a popular
+/// short prefix can be held by the whole fleet, so an unbounded climb would cost
+/// `depth × fleet_size` per selection on the hot path. Past this many levels a
+/// worker is behind by ~16k tokens at a 64-token block, which a cost model
+/// scores as a rounding error against a 100k-token prompt anyway. Workers cut
+/// off here read as 0 overlap, which biases toward the deeper holders — the
+/// conservative direction for locality.
+pub const PER_WORKER_CLIMB_LEVELS: usize = 256;
+
 /// One node of a tree snapshot, as produced by
 /// [`HashTree::export_snapshot`] and consumed by
 /// [`HashTree::restore_snapshot`].
@@ -643,6 +672,67 @@ impl TreeState {
         }
     }
 
+    /// Same descent as [`Self::match_prefix`], then a bounded climb back up
+    /// collecting each worker's deepest matched depth.
+    ///
+    /// Climbing rather than recording on the way down is what makes the cost
+    /// bounded: descending would touch every owner set on the path, and those
+    /// grow toward the root. Climbing from the deepest node, the first time a
+    /// worker is seen IS its deepest match, so each is written once and the walk
+    /// stops after [`PER_WORKER_CLIMB_LEVELS`].
+    fn match_prefix_scored(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> ScoredMatch {
+        let result = self.match_prefix(parent_hash, block_hashes);
+        let mut per_worker_blocks: FxHashMap<KvWorkerId, usize> = FxHashMap::default();
+        if result.matched_blocks == 0 {
+            return ScoredMatch {
+                matched_blocks: 0,
+                per_worker_blocks,
+            };
+        }
+        // Re-descend to the deepest node so the climb has a starting point.
+        // Cheap relative to the climb: one child lookup per level, no owner
+        // iteration.
+        let start = match parent_hash {
+            None => ROOT_ID,
+            Some(p) => match self.by_hash.get(&p) {
+                Some(set) if set.len() == 1 => *set.iter().next().unwrap(),
+                _ => ROOT_ID,
+            },
+        };
+        let mut current = start;
+        for &h in block_hashes.iter().take(result.matched_blocks) {
+            match self
+                .nodes
+                .get(&current)
+                .and_then(|n| n.children.get(&h).copied())
+            {
+                Some(child) => current = child,
+                None => break,
+            }
+        }
+        let mut depth = result.matched_blocks;
+        let mut levels = 0usize;
+        while levels < PER_WORKER_CLIMB_LEVELS && depth > 0 {
+            let Some(node) = self.nodes.get(&current) else {
+                break;
+            };
+            for w in &node.workers {
+                // First write wins: the climb visits deepest-first.
+                per_worker_blocks.entry(w.clone()).or_insert(depth);
+            }
+            match node.parent {
+                Some(parent) => current = parent,
+                None => break,
+            }
+            depth -= 1;
+            levels += 1;
+        }
+        ScoredMatch {
+            matched_blocks: result.matched_blocks,
+            per_worker_blocks,
+        }
+    }
+
     /// Count of *non-root* nodes in this shard.
     fn node_count(&self) -> usize {
         // Subtract one for the root sentinel.
@@ -927,6 +1017,23 @@ impl HashTree {
         self.shards[idx]
             .read()
             .match_prefix(effective_parent, block_hashes)
+    }
+
+    /// Per-worker prefix overlap for cost-based selection. See
+    /// [`ScoredMatch`]; routing and sharding are identical to
+    /// [`Self::match_prefix`].
+    pub fn match_prefix_scored(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+    ) -> ScoredMatch {
+        if block_hashes.is_empty() {
+            return ScoredMatch::default();
+        }
+        let (idx, effective_parent) = self.route_match(parent_hash, block_hashes);
+        self.shards[idx]
+            .read()
+            .match_prefix_scored(effective_parent, block_hashes)
     }
 
     /// Number of non-root nodes across all shards (root sentinels are not
@@ -1238,6 +1345,65 @@ mod tests {
 
     fn workers(ids: &[&KvWorkerId]) -> HashSet<KvWorkerId> {
         ids.iter().map(|w| (*w).clone()).collect()
+    }
+
+    /// The distinction the owner set cannot express: `w_deep` holds the whole
+    /// prefix, `w_near` diverges two blocks early. `match_prefix` reports only
+    /// `w_deep`; a cost model needs to know `w_near` is nearly as good.
+    #[test]
+    fn match_prefix_scored_reports_each_workers_own_depth() {
+        let tree = HashTree::new();
+        let chain = [10i64, 20, 30, 40, 50];
+        let w_deep = worker("http://deep:30000", 0);
+        let w_near = worker("http://near:30000", 0);
+        let w_shallow = worker("http://shallow:30000", 0);
+        tree.insert(&w_deep, None, &chain);
+        tree.insert(&w_near, None, &chain[..3]);
+        tree.insert(&w_shallow, None, &chain[..1]);
+
+        let plain = tree.match_prefix(None, &chain);
+        assert_eq!(plain.matched_blocks, 5);
+        assert_eq!(
+            plain.workers,
+            workers(&[&w_deep]),
+            "the owner set names only the deepest holder"
+        );
+
+        let scored = tree.match_prefix_scored(None, &chain);
+        assert_eq!(scored.matched_blocks, 5);
+        assert_eq!(scored.per_worker_blocks.get(&w_deep).copied(), Some(5));
+        assert_eq!(
+            scored.per_worker_blocks.get(&w_near).copied(),
+            Some(3),
+            "a worker that diverges early must report its own depth, not 0"
+        );
+        assert_eq!(scored.per_worker_blocks.get(&w_shallow).copied(), Some(1));
+    }
+
+    /// A worker holding nothing on this path is absent, and callers read that
+    /// as zero overlap.
+    #[test]
+    fn match_prefix_scored_omits_workers_off_the_path() {
+        let tree = HashTree::new();
+        let mine = worker("http://mine:30000", 0);
+        let other = worker("http://other:30000", 0);
+        tree.insert(&mine, None, &[1i64, 2, 3]);
+        tree.insert(&other, None, &[99i64, 98]);
+
+        let scored = tree.match_prefix_scored(None, &[1i64, 2, 3]);
+        assert_eq!(scored.per_worker_blocks.get(&mine).copied(), Some(3));
+        assert!(!scored.per_worker_blocks.contains_key(&other));
+    }
+
+    /// No match at all yields an empty map rather than zero-valued entries, so
+    /// callers cannot mistake "known to hold nothing" for "holds nothing".
+    #[test]
+    fn match_prefix_scored_on_a_miss_is_empty() {
+        let tree = HashTree::new();
+        tree.insert(&worker("http://w:30000", 0), None, &[1i64, 2]);
+        let scored = tree.match_prefix_scored(None, &[7i64, 8]);
+        assert_eq!(scored.matched_blocks, 0);
+        assert!(scored.per_worker_blocks.is_empty());
     }
 
     #[test]

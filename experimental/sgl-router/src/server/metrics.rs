@@ -368,6 +368,12 @@ pub enum CacheAwareDecision {
     /// fleet size — with sampled picks the chosen worker usually does not
     /// hold the prefix.
     CacheHitAllQueued,
+    /// Chosen by the cost model: estimated prefill seconds plus estimated
+    /// queue seconds, minimised across candidates. Not a hit-or-miss verdict —
+    /// cost routinely picks a partially-warm worker — so
+    /// `sgl_router_diverted_overlap_blocks` carries how much prefix each such
+    /// selection declined to reuse.
+    CostSelected,
 }
 
 impl CacheAwareDecision {
@@ -386,6 +392,7 @@ impl CacheAwareDecision {
             Self::MatchedWorkersIneligible => "matched_workers_ineligible",
             Self::CacheWorkerQueued => "cache_worker_queued",
             Self::CacheHitAllQueued => "cache_hit_all_queued",
+            Self::CostSelected => "cost_selected",
         }
     }
 }

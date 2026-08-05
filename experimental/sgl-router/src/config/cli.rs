@@ -157,9 +157,30 @@ pub struct Cli {
     /// unqueued workers first and only from queueing ones when nothing is
     /// unqueued. A value of 1 is uniform-random routing among the eligible
     /// tier, not the exact minimum — set this at or above the fleet size for
-    /// the deterministic exact fleet-wide minimum.
+    /// the deterministic exact fleet-wide minimum. Under the cost model
+    /// (`--cost-prefill-tokens-per-sec`) the sample is ranked by estimated
+    /// seconds-to-first-token instead of load.
     #[arg(long)]
     pub min_load_choices: Option<NonZeroUsize>,
+
+    /// Sustained prefill throughput of one engine, in tokens/sec. Enables the
+    /// cost model, which scores the `--min-load-choices` sampled candidates by
+    /// estimated seconds to first
+    /// token — uncached prefill plus queue wait — and takes the cheapest,
+    /// instead of gating on the queue alone. Requires
+    /// `--cost-mean-service-secs`.
+    ///
+    /// Unlike a queue threshold this weighs how much prefix is at stake, so a
+    /// nearly-fully-cached request holds its home through a queue that a
+    /// barely-cached one flees. Calibrate the RATIO of the two constants: too
+    /// small a queue term degenerates to pure cache affinity, too large to pure
+    /// least-queue routing.
+    #[arg(long)]
+    pub cost_prefill_tokens_per_sec: Option<f32>,
+    /// Seconds one queued request takes to clear — what each place in the queue
+    /// costs the next arrival. Requires `--cost-prefill-tokens-per-sec`.
+    #[arg(long)]
+    pub cost_mean_service_secs: Option<f32>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -343,13 +364,53 @@ impl Cli {
             || self.kv_bootstrap_fetch_timeout_cap_ms.is_some()
             || self.kv_peer_selector.is_some()
             || self.worker_queue_limit.is_some()
-            || self.min_load_choices.is_some();
+            || self.min_load_choices.is_some()
+            || self.cost_prefill_tokens_per_sec.is_some()
+            || self.cost_mean_service_secs.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
                  --balance-rel-threshold / --kv-bootstrap-timeout-ms / \
                  --kv-bootstrap-fetch-timeout-cap-ms / --kv-peer-selector / \
-                 --worker-queue-limit / --min-load-choices) requires --policy cache_aware_zmq"
+                 --worker-queue-limit / --min-load-choices / --cost-*) requires --policy cache_aware_zmq"
+            ));
+        }
+        // The cost model needs both constants: one alone cannot convert tokens
+        // and queue places into the same unit, which is the only thing that
+        // makes the two terms addable.
+        if self.cost_prefill_tokens_per_sec.is_some() != self.cost_mean_service_secs.is_some() {
+            return Err(anyhow!(
+                "--cost-prefill-tokens-per-sec and --cost-mean-service-secs must be set together; \
+                 the cost model adds seconds of prefill to seconds of queueing, so it needs both \
+                 conversions"
+            ));
+        }
+        if let Some(rate) = self.cost_prefill_tokens_per_sec {
+            if !rate.is_finite() || rate <= 0.0 {
+                return Err(anyhow!(
+                    "--cost-prefill-tokens-per-sec must be a finite value > 0 (got {rate})"
+                ));
+            }
+        }
+        if let Some(secs) = self.cost_mean_service_secs {
+            if !secs.is_finite() || secs < 0.0 {
+                return Err(anyhow!(
+                    "--cost-mean-service-secs must be a finite value >= 0 (got {secs})"
+                ));
+            }
+        }
+        // The three load-gate strategies are alternatives, so at most one may be
+        // configured — otherwise an operator believes a knob is live that the
+        // policy never reads.
+        if self.cost_prefill_tokens_per_sec.is_some()
+            && (self.worker_queue_limit.is_some()
+                || self.balance_abs_threshold.is_some()
+                || self.balance_rel_threshold.is_some())
+        {
+            return Err(anyhow!(
+                "--cost-* selects the cost model, which replaces the other load gates; it cannot \
+                 be combined with --worker-queue-limit / --balance-abs-threshold / \
+                 --balance-rel-threshold"
             ));
         }
         // The queue gate replaces the fleet-spread check rather than layering on
@@ -490,9 +551,17 @@ impl Cli {
             let d = CacheAwareConfig::default();
             // `validate` has already rejected the combination, so the queue
             // limit alone decides which gate is built.
-            let load_gate = match self.worker_queue_limit {
-                Some(limit) => LoadGate::PerWorkerQueue(limit),
-                None => LoadGate::FleetSpread {
+            let load_gate = match (
+                self.cost_prefill_tokens_per_sec,
+                self.cost_mean_service_secs,
+                self.worker_queue_limit,
+            ) {
+                (Some(prefill_tokens_per_sec), Some(mean_service_secs), _) => LoadGate::Cost {
+                    prefill_tokens_per_sec,
+                    mean_service_secs,
+                },
+                (_, _, Some(limit)) => LoadGate::PerWorkerQueue(limit),
+                _ => LoadGate::FleetSpread {
                     abs_threshold: self
                         .balance_abs_threshold
                         .unwrap_or(LoadGate::DEFAULT_ABS_THRESHOLD),
@@ -1442,6 +1511,116 @@ mod tests {
             .unwrap_err()
             .to_string();
             assert!(err.contains("cannot be combined"), "{spread:?} got: {err}");
+        }
+    }
+
+    #[test]
+    fn cost_flags_build_the_cost_gate() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--cost-prefill-tokens-per-sec",
+            "9000",
+            "--cost-mean-service-secs",
+            "0.35",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        match ca.load_gate {
+            LoadGate::Cost {
+                prefill_tokens_per_sec,
+                mean_service_secs,
+            } => {
+                assert_eq!(prefill_tokens_per_sec, 9000.0);
+                assert_eq!(mean_service_secs, 0.35);
+            }
+            other => panic!("expected the cost gate, got {other:?}"),
+        }
+        assert_eq!(ca.load_gate.queue_limit(), None, "cost has no queue limit");
+    }
+
+    /// One constant alone cannot convert tokens and queue places into the same
+    /// unit, which is the only thing that makes the two terms addable.
+    #[test]
+    fn rejects_half_configured_cost_model() {
+        for half in [
+            ["--cost-prefill-tokens-per-sec", "9000"],
+            ["--cost-mean-service-secs", "0.35"],
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                "cache_aware_zmq",
+                half[0],
+                half[1],
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("must be set together"), "{half:?} got: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_nonsense_cost_constants() {
+        // `--flag=value` form so a negative value is not read as a new flag.
+        for (prefill, service, needle) in [
+            (
+                "--cost-prefill-tokens-per-sec=0",
+                "--cost-mean-service-secs=0.35",
+                "> 0",
+            ),
+            (
+                "--cost-prefill-tokens-per-sec=nan",
+                "--cost-mean-service-secs=0.35",
+                "> 0",
+            ),
+            (
+                "--cost-prefill-tokens-per-sec=9000",
+                "--cost-mean-service-secs=-1",
+                ">= 0",
+            ),
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                "cache_aware_zmq",
+                prefill,
+                service,
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(needle), "{prefill} {service} got: {err}");
+        }
+    }
+
+    /// The three strategies are alternatives; accepting two would leave one
+    /// silently unread.
+    #[test]
+    fn rejects_cost_combined_with_another_load_gate() {
+        for other in [
+            ["--worker-queue-limit", "4"],
+            ["--balance-abs-threshold", "40"],
+            ["--balance-rel-threshold", "1.5"],
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                "cache_aware_zmq",
+                "--cost-prefill-tokens-per-sec",
+                "9000",
+                "--cost-mean-service-secs",
+                "0.35",
+                other[0],
+                other[1],
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("cannot be combined"), "{other:?} got: {err}");
         }
     }
 

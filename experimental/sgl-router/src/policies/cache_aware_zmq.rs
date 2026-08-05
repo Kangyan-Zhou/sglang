@@ -32,14 +32,20 @@
 //! workers that are idle on the engine side but still draining a finished
 //! stream to a slow client.
 //!
-//! 1. **Load gate**, per [`crate::config::LoadGate`]. Two mutually exclusive
-//!    strategies; see that type for why each measures what it does.
+//! 1. **Load gate**, per [`crate::config::LoadGate`]. Three mutually
+//!    exclusive strategies; see that type for why each measures what it
+//!    does.
 //!
 //!    `PerWorkerQueue` defers to step 3, because a per-worker question cannot
 //!    be answered until the cache has named a worker. The cache lookup is
 //!    unchanged, but every min-load fallback in this file additionally prefers
 //!    a non-queueing worker — including the below-threshold tree-miss path,
 //!    which is the highest-volume one.
+//!
+//!    `Cost` also defers: it cannot price a queue against a prefix until the
+//!    prefix lookup has said what each worker holds, so step 3.5 scores the
+//!    sampled candidates by estimated seconds-to-first-token instead of any
+//!    gate/veto.
 //!
 //!    `FleetSpread` — the default — decides here: when the spread is wide it
 //!    skips the cache lookup entirely and picks the lowest-load of a
@@ -388,6 +394,138 @@ impl CacheAwareZmqPolicy {
         min_of(sample)
     }
 
+    /// Rank every candidate by [`LoadGate::cost_secs`] and take the cheapest:
+    /// estimated seconds-to-first-token, minimised over a `min_load_choices`
+    /// sample of the fleet: cost(w) = uncached prefill seconds + queue wait
+    /// seconds (see [`LoadGate::Cost`] for the formula and calibration).
+    ///
+    /// The other strategies filter and then break ties by load; this one has
+    /// no filter — a worker holding none of the prefix is not excluded, it is
+    /// simply charged the full prefill, and a queueing worker is not excluded,
+    /// it is charged its queue. That is the whole point: the two costs are in
+    /// the same unit, so they trade off instead of one vetoing the other.
+    ///
+    /// The sample serves the same purpose as in `pick_min_load`: an exact
+    /// fleet-wide argmin converges across replicas — every replica computes
+    /// the same cheapest worker from the same snapshots and stampedes it. The
+    /// ranking is applied to `min_load_choices` uniformly drawn candidates;
+    /// `>= fleet size` recovers exact argmin (unsampled).
+    ///
+    /// Overlap is per-worker (see [`HashTree::match_prefix_scored`]) rather than
+    /// the deepest-node owner set, because charging a worker that diverges a few
+    /// blocks early the full prompt would be exactly the misvaluation this is
+    /// meant to remove. On a bimodal fleet each worker is scored under BOTH
+    /// hashing modes and credited the better match — the same dual-hash rule
+    /// [`Self::match_request`] applies — so an EAGLE-warm prefix is never
+    /// charged a full non-EAGLE prefill.
+    fn select_by_cost(
+        &self,
+        workers: &[Arc<Worker>],
+        loads: &WorkerLoads,
+        ctx: &SelectionContext<'_>,
+        tokens: &[u32],
+        block_size: usize,
+        primary_bigram: bool,
+    ) -> Option<Arc<Worker>> {
+        let model_id = ctx.model().0.as_str();
+        let bimodal = self.block_size_oracle.is_bimodal();
+        let modes: &[bool] = match (bimodal, primary_bigram) {
+            (false, true) => &[true],
+            (false, false) => &[false],
+            (true, true) => &[true, false],
+            (true, false) => &[false, true],
+        };
+        // url -> best per-worker matched block count across modes and dp ranks.
+        let mut per_worker: HashMap<String, usize> = HashMap::new();
+        // Best-matching mode's (rate, matched_blocks, query_blocks), one sample
+        // per request for the overlap metrics.
+        let mut best: Option<(f32, usize, usize)> = None;
+        for &mode_bigram in modes {
+            let hashes = if mode_bigram {
+                compute_block_hashes_bigram(tokens, block_size)
+            } else {
+                compute_block_hashes(tokens, block_size)
+            };
+            if hashes.is_empty() {
+                continue;
+            }
+            let scored = self.tree.match_prefix_scored(None, &hashes);
+            let rate = scored.matched_blocks as f32 / hashes.len() as f32;
+            if best.is_none_or(|(r, _, _)| rate > r) {
+                best = Some((rate, scored.matched_blocks, hashes.len()));
+            }
+            for (id, blocks) in scored.per_worker_blocks {
+                per_worker
+                    .entry(id.url)
+                    .and_modify(|b| *b = (*b).max(blocks))
+                    .or_insert(blocks);
+            }
+        }
+        if let Some((_, matched_blocks, query_blocks)) = best {
+            if let Some(m) = self.metrics.get() {
+                m.observe_overlap_blocks(model_id, matched_blocks as u64);
+                m.add_cache_aware_query_blocks(model_id, query_blocks as u64);
+            }
+        }
+
+        let blocks_of = |w: &Arc<Worker>| per_worker.get(&w.url).copied().unwrap_or(0);
+        let cost_of = |w: &Arc<Worker>| -> f64 {
+            let cached = blocks_of(w).saturating_mul(block_size);
+            self.config
+                .load_gate
+                .cost_secs(tokens.len().saturating_sub(cached), loads.waiting_of(w))
+                .unwrap_or(f64::MAX)
+        };
+
+        // Sample, then rank the sample by cost: same partial-shuffle draw as
+        // `pick_min_load` — `partial_shuffle` leaves the sample in the TAIL.
+        let mut pool: Vec<usize> = (0..workers.len()).collect();
+        let k = self.config.min_load_choices.max(1).min(pool.len());
+        if k == 0 {
+            return None;
+        }
+        if k < pool.len() {
+            use rand::seq::SliceRandom;
+            pool.partial_shuffle(&mut rand::thread_rng(), k);
+            pool = pool.split_off(pool.len() - k);
+        }
+        let chosen = pool
+            .iter()
+            .map(|&i| &workers[i])
+            .min_by(|a, b| {
+                // `total_cmp`, not `partial_cmp().unwrap()`: a NaN from a
+                // misconfigured constant must order deterministically rather
+                // than panic on the request path.
+                cost_of(a).total_cmp(&cost_of(b))
+            })
+            .map(Arc::clone)?;
+
+        let chosen_blocks = blocks_of(&chosen);
+        let best_blocks = workers.iter().map(&blocks_of).max().unwrap_or(0);
+        let forgone = best_blocks.saturating_sub(chosen_blocks);
+        self.record_decision(model_id, CacheAwareDecision::CostSelected);
+        if forgone > 0 {
+            if let Some(m) = self.metrics.get() {
+                // Same meaning as under the queue gate: prefix this selection
+                // declined to reuse. Here it is a margin rather than the whole
+                // match, because cost can pick a partially-warm worker.
+                m.observe_diverted_overlap_blocks(model_id, forgone as u64);
+            }
+        }
+        tracing::debug!(
+            model = %ctx.model(),
+            worker = %chosen.url,
+            cost_secs = cost_of(&chosen),
+            chosen_blocks,
+            best_blocks,
+            forgone_blocks = forgone,
+            worker_waiting = ?loads.waiting_of(&chosen),
+            sample_size = k,
+            "cache-aware-zmq: selected worker by cost",
+        );
+        Some(chosen)
+    }
+
     /// Detect load imbalance. Returns the min/max load snapshot together
     /// with the `imbalanced` verdict — `true` when the spread between max
     /// and min load is large enough that cache-aware routing would dump
@@ -526,6 +664,16 @@ impl Policy for CacheAwareZmqPolicy {
         //    fallen back to the per-process in-flight counter, which silently
         //    rescales every load comparison below it.
         match self.config.load_gate {
+            LoadGate::Cost { .. } => {
+                // Cost ranks rather than gates, so there is nothing to decide
+                // until the prefix lookup has told us what each worker holds.
+                tracing::debug!(
+                    model = %ctx.model(),
+                    engine_load_workers = loads.engine_worker_count(),
+                    engine_load_expected = self.engine_load.expected_count(),
+                    "cache-aware-zmq: cost model active; scoring deferred to the prefix lookup",
+                );
+            }
             LoadGate::PerWorkerQueue(limit) => {
                 // `waiting_of` is `None` for every worker here, so the gate
                 // admits everything and the fleet-spread strategy it replaced
@@ -693,6 +841,16 @@ impl Policy for CacheAwareZmqPolicy {
                 &loads,
                 &self.config.load_gate,
                 self.config.min_load_choices,
+            );
+        }
+        if matches!(self.config.load_gate, LoadGate::Cost { .. }) {
+            return self.select_by_cost(
+                workers,
+                &loads,
+                ctx,
+                tokens,
+                block_size as usize,
+                is_bigram,
             );
         }
         tracing::debug!(
@@ -3476,5 +3634,195 @@ mod tests {
                 "no prefix was given up for home={home:?}; got:\n{rendered}"
             );
         }
+    }
+
+    // ---- cost model ----
+
+    fn cost_cfg(prefill_tokens_per_sec: f32, mean_service_secs: f32) -> CacheAwareConfig {
+        CacheAwareConfig {
+            cache_threshold: 0.0,
+            load_gate: LoadGate::Cost {
+                prefill_tokens_per_sec,
+                mean_service_secs,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The behaviour a binary gate cannot express, in both directions, on ONE
+    /// fixture: the cache home is queueing either way, and only the value of
+    /// what it holds changes. A well-cached request rides out the queue; a
+    /// barely-cached one leaves. `PerWorkerQueue` diverts both.
+    #[test]
+    fn cost_weighs_forgone_prefill_against_queue_wait() {
+        let registry = tokenizer_registry_with_tiny();
+        let model = ModelId("tiny".into());
+        let tok = registry.get("tiny").unwrap();
+
+        for (label, owners, expect) in [
+            // w0 holds the whole prompt: skipping it costs a full re-prefill,
+            // which dwarfs a queue of 5.
+            ("well cached", vec!["http://w0:30000"], "http://w0:30000"),
+            // Nobody holds it: there is no prefill to save, so the queue decides.
+            ("uncached", vec![], "http://w1:30000"),
+        ] {
+            let (tree, body) = queue_fixture(&registry, &owners);
+            let engine_load = EngineLoadTable::new();
+            let now = Instant::now();
+            engine_load.set("http://w0:30000", 0, load_stat(5, 5), now); // queueing
+            engine_load.set("http://w1:30000", 0, load_stat(5, 0), now); // idle queue
+
+            // Constants scaled to this fixture, not to production: the tiny
+            // tokenizer yields a ~13-token prompt, so at a realistic prefill
+            // rate a full re-prefill would be microseconds and the queue would
+            // always win. What the test pins is the RATIO — at 1 tok/s and 1 s
+            // per queued request, re-prefilling the whole prompt (~13 s) costs
+            // more than w0's 5-deep queue (5 s), and skipping a fully cached
+            // home is therefore the wrong trade. Production sees the same
+            // relation at ~89k tokens against realistic rates.
+            let policy = new_policy_with_load(
+                cost_cfg(1.0, 1.0),
+                tree,
+                Arc::clone(&registry),
+                oracle_for_tests(4),
+                engine_load,
+            );
+            let workers = vec![
+                worker("http://w0:30000", "tiny"),
+                worker("http://w1:30000", "tiny"),
+            ];
+            let ctx = SelectionContext::new(&model, Some(&body));
+            assert_eq!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                expect,
+                "{label}: cost must trade prefill against queue, not gate on queue alone",
+            );
+        }
+
+        // Same well-cached fixture under the binary gate: diverted regardless of
+        // what the home holds. This is the difference, asserted.
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(5, 5), now);
+        engine_load.set("http://w1:30000", 0, load_stat(5, 0), now);
+        let gated = new_policy_with_load(
+            queue_cfg(4),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let _ = tok;
+        assert_eq!(
+            gated.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "the binary gate diverts the well-cached request too — the case cost fixes",
+        );
+    }
+
+    /// The queue term has to actually bite: hold the prefix constant and make
+    /// the queue expensive enough to outweigh it.
+    #[test]
+    fn cost_leaves_the_cache_home_when_the_queue_outweighs_the_prefill() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(5, 9), now);
+        engine_load.set("http://w1:30000", 0, load_stat(5, 0), now);
+
+        // Fast prefill (cheap to redo) and a costly queue: the trade flips.
+        let policy = new_policy_with_load(
+            cost_cfg(10_000.0, 5.0),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+        );
+    }
+
+    /// A worker that diverges slightly from the best is charged only for what
+    /// it is missing, not the whole prompt. Charging it in full is the
+    /// misvaluation per-worker overlap exists to remove, and it would make cost
+    /// behave like the owner-set gate it replaces.
+    #[test]
+    fn cost_charges_a_near_miss_worker_only_for_what_it_lacks() {
+        let registry = tokenizer_registry_with_tiny();
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, QUEUE_TEXT).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(hashes.len() >= 3, "fixture needs a few blocks to truncate");
+
+        let tree = Arc::new(HashTree::new());
+        // w0 holds everything but is queueing; w1 is one block short and idle.
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        tree.insert(
+            &KvWorkerId::new("http://w1:30000".into(), 0),
+            None,
+            &hashes[..hashes.len() - 1],
+        );
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": QUEUE_TEXT})).unwrap();
+
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(5, 3), now);
+        engine_load.set("http://w1:30000", 0, load_stat(5, 0), now);
+
+        // One block (4 tokens) of re-prefill at 4 tok/s = 1 s, against w0's
+        // 3-deep queue at 1 s each = 3 s. w1 wins ONLY because it is charged
+        // for one block; charged the whole prompt it would lose.
+        let policy = new_policy_with_load(
+            cost_cfg(4.0, 1.0),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "a near-miss worker must be charged its margin, not the whole prompt",
+        );
+    }
+
+    /// An unknown queue contributes no queue term rather than a guessed one —
+    /// the same fail-open rule the other strategies use.
+    #[test]
+    fn cost_treats_an_unknown_queue_as_no_queue() {
+        let gate = LoadGate::Cost {
+            prefill_tokens_per_sec: 100.0,
+            mean_service_secs: 2.0,
+        };
+        assert_eq!(gate.cost_secs(1000, None), Some(10.0));
+        assert_eq!(gate.cost_secs(1000, Some(0)), Some(10.0));
+        assert_eq!(gate.cost_secs(1000, Some(3)), Some(16.0));
+        assert_eq!(gate.cost_secs(0, Some(3)), Some(6.0));
+        // The other strategies do not score.
+        assert!(LoadGate::default().cost_secs(1000, Some(3)).is_none());
+        assert!(LoadGate::PerWorkerQueue(NonZeroUsize::new(4).unwrap())
+            .cost_secs(1000, Some(3))
+            .is_none());
     }
 }
