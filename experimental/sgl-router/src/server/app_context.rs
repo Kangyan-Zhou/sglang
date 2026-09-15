@@ -198,6 +198,21 @@ impl AppContext {
             .is_none_or(|idx| idx.bootstrap().settled())
     }
 
+    /// Whether the seed-required gate permits readiness. See
+    /// [`BootstrapTracker::seed_gate_open`](crate::policies::kv_events::BootstrapTracker::seed_gate_open).
+    pub fn kv_seed_gate_open(&self) -> bool {
+        self.kv_index
+            .get()
+            .is_none_or(|idx| idx.bootstrap().seed_gate_open())
+    }
+
+    /// Latch the seed gate open once this replica has served a ready 200.
+    pub fn mark_kv_seed_gate_passed(&self) {
+        if let Some(idx) = self.kv_index.get() {
+            idx.bootstrap().mark_seed_gate_passed();
+        }
+    }
+
     pub fn mark_ready(&self) {
         // Relaxed: this flag does not synchronize other state; readers only
         // care about eventual visibility, not happens-before with surrounding ops.

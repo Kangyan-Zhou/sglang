@@ -184,6 +184,13 @@ pub struct Cli {
     /// longer fits under the derived value.
     #[arg(long)]
     pub kv_bootstrap_fetch_timeout_cap_ms: Option<u64>,
+    /// Hold `/readyz` at 503 when peer bootstrap proved siblings were present
+    /// and their tree could not be pulled, so a failed seed stalls a rolling
+    /// update instead of completing it with cache-blind replicas. A first
+    /// deploy and a cold fleet are unaffected; the hold is bounded at three
+    /// times `--kv-bootstrap-timeout-ms`.
+    #[arg(long)]
+    pub kv_bootstrap_seed_required: bool,
     /// Label selector matching this router's own pods, so a booting replica can
     /// find siblings to pull a tree snapshot from. Unset disables peer
     /// bootstrap and every replica starts cold.
@@ -466,6 +473,7 @@ impl Cli {
             || self.balance_rel_threshold.is_some()
             || self.kv_bootstrap_timeout_ms.is_some()
             || self.kv_bootstrap_fetch_timeout_cap_ms.is_some()
+            || self.kv_bootstrap_seed_required
             || self.kv_peer_selector.is_some()
             || self.worker_queue_limit.is_some()
             || self.min_load_choices.is_some()
@@ -476,7 +484,8 @@ impl Cli {
             return Err(anyhow!(
                 "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
                  --balance-rel-threshold / --kv-bootstrap-timeout-ms / \
-                 --kv-bootstrap-fetch-timeout-cap-ms / --kv-peer-selector / \
+                 --kv-bootstrap-fetch-timeout-cap-ms / --kv-bootstrap-seed-required / \
+                 --kv-peer-selector / \
                  --worker-queue-limit / --min-load-choices / --saturation-queue-floor / \
                  --mm-affinity-idle-secs / --mm-affinity-eviction-interval-secs) \
                  requires --policy cache_aware_zmq"
@@ -683,6 +692,8 @@ impl Cli {
                 bootstrap_fetch_timeout_cap_ms: self
                     .kv_bootstrap_fetch_timeout_cap_ms
                     .unwrap_or(d.bootstrap_fetch_timeout_cap_ms),
+                bootstrap_seed_required: self.kv_bootstrap_seed_required
+                    || d.bootstrap_seed_required,
                 min_load_choices: self
                     .min_load_choices
                     .map(NonZeroUsize::get)

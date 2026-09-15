@@ -41,7 +41,7 @@ use super::block_size_oracle::BlockSizeOracle;
 use super::bootstrap::{
     fetch_cursors, fetch_snapshot, BootstrapState, BootstrapTracker, FetchAnswer, PeerRegistry,
     PeerSnapshot, RankOutcome, SnapshotOutcome, SweepOutcome, VettedSnapshot, WireWorker,
-    SNAPSHOT_FORMAT,
+    SNAPSHOT_FETCH_CONNECT_TIMEOUT, SNAPSHOT_FETCH_READ_TIMEOUT, SNAPSHOT_FORMAT,
 };
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
@@ -748,10 +748,18 @@ impl KvEventIndex {
         block_size_oracle: Arc<BlockSizeOracle>,
         bootstrap: Arc<BootstrapTracker>,
     ) -> Arc<Self> {
-        // A fraction of the deadline, not the deadline itself: see
-        // `snapshot_fetch_timeout`. The sweep bounds the whole search, but only a
-        // shorter per-request bound lets it reach a second candidate.
+        // Three bounds, because "this peer is hung" and "this snapshot is big"
+        // need opposite answers and a lone total timeout gives them the same one.
+        // `connect` cuts a peer that is gone, `read` cuts one that stopped
+        // sending mid-body, and only then does the total bound a transfer that
+        // is genuinely progressing — a fraction of the deadline, not the
+        // deadline itself, so the sweep can still reach a second candidate (see
+        // `snapshot_fetch_timeout`). Sizing the TOTAL for a hung peer is what
+        // made a warm fleet unbootstrappable; see
+        // `DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP`.
         let snapshot_http = reqwest::Client::builder()
+            .connect_timeout(SNAPSHOT_FETCH_CONNECT_TIMEOUT)
+            .read_timeout(SNAPSHOT_FETCH_READ_TIMEOUT)
             .timeout(snapshot_fetch_timeout(
                 bootstrap.timeout(),
                 bootstrap.fetch_cap(),
@@ -1518,6 +1526,17 @@ impl SweepResult {
             Self::TimedOut { .. } => SweepOutcome::TimedOut,
         }
     }
+
+    /// Size of the candidate set the verdict was proven over. `Found` reports
+    /// 1 — the peer that answered — so a success is never mistaken for a
+    /// verdict reached over nobody.
+    fn peers_tried(&self) -> usize {
+        match self {
+            Self::Found(_) => 1,
+            Self::NoPeers => 0,
+            Self::FleetCold { peers_tried } | Self::TimedOut { peers_tried, .. } => *peers_tried,
+        }
+    }
 }
 
 /// Sweep peers until one yields a usable snapshot, every sibling proves it
@@ -1592,7 +1611,8 @@ async fn deliver_bootstrap(
     deadline: Duration,
 ) {
     let n = obligations.len();
-    deps.bootstrap.record_sweep_result(result.outcome());
+    deps.bootstrap
+        .record_sweep_result(result.outcome(), result.peers_tried());
     let msg = match result {
         SweepResult::Found(vetted) => PumpControl::ApplySnapshot {
             obligations,

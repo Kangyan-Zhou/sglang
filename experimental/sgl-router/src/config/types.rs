@@ -661,6 +661,19 @@ pub struct CacheAwareConfig {
     /// Raise it when the fleet's tree is large enough that one transfer +
     /// decode of the snapshot body no longer fits under the derived value.
     pub bootstrap_fetch_timeout_cap_ms: u64,
+    /// Hold `/readyz` at 503 when a sweep proved siblings were present and
+    /// their tree could not be pulled, instead of serving cache-blind.
+    ///
+    /// Off by default. A NotReady pod is absent from the Service, so with this
+    /// on a failed seed STALLS a rolling update — the previous generation keeps
+    /// serving — rather than completing it with replicas that route cache-blind
+    /// and scatter the prefixes the warm replicas were keeping consolidated.
+    /// Only a `TimedOut` sweep over a non-empty candidate set counts; a first
+    /// deploy (`NoPeers`) and a cold fleet (`FleetCold`) are unaffected, and
+    /// the hold is bounded at three times `bootstrap_timeout_ms` so a
+    /// simultaneous fleet-wide restart degrades to a delay rather than an
+    /// outage with no exit.
+    pub bootstrap_seed_required: bool,
     /// Candidates sampled for each min-load fallback pick: the pick is the
     /// least-loaded of this many uniformly random eligible workers, not the
     /// fleet-wide minimum. Default 2 (power-of-two choices), which damps the
@@ -722,6 +735,7 @@ impl Default for CacheAwareConfig {
             load_gate: LoadGate::default(),
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
             bootstrap_fetch_timeout_cap_ms: default_bootstrap_fetch_timeout_cap_ms(),
+            bootstrap_seed_required: false,
             min_load_choices: default_min_load_choices(),
             saturation_queue_floor: None,
             mm_affinity_idle_secs: default_mm_affinity_idle_secs(),
@@ -758,12 +772,15 @@ pub(crate) fn default_bootstrap_timeout_ms() -> u64 {
     5_000
 }
 
-/// 30s: comfortably past one gzipped transfer + decode of a snapshot body,
-/// small enough that a generous `--kv-bootstrap-timeout-ms` cannot park the
-/// sweep on one hung peer (see the field doc). Must agree with
+/// 120s: comfortably past one gzipped transfer + decode of a snapshot body on
+/// a warm fleet — measured at 40 MB gzipped / 208 MB inflated / 17s on a
+/// 61-engine Kimi-K3 fleet at half its usual tree size. A hung peer is no
+/// longer this value's problem: `SNAPSHOT_FETCH_CONNECT_TIMEOUT` and
+/// `SNAPSHOT_FETCH_READ_TIMEOUT` bound "not answering" and "stopped sending",
+/// leaving this to bound only a transfer that is progressing. Must agree with
 /// `DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP`; a test pins the two.
 pub(crate) fn default_bootstrap_fetch_timeout_cap_ms() -> u64 {
-    30_000
+    120_000
 }
 
 fn default_min_load_choices() -> usize {
