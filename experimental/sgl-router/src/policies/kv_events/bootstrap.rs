@@ -143,7 +143,48 @@ pub const PRODUCER_CACHE_TTL: Duration = Duration::from_secs(2);
 /// Default upper bound on one peer-snapshot fetch; see the
 /// `bootstrap_fetch_timeout_cap_ms` field doc for the rationale, and
 /// `default_bootstrap_fetch_timeout_cap_ms`, which must agree with this.
-pub const DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP: Duration = Duration::from_secs(30);
+///
+/// This bounds a transfer that is MAKING PROGRESS. A peer that stops sending is
+/// caught far sooner by [`SNAPSHOT_FETCH_READ_TIMEOUT`], and one that never
+/// answers by [`SNAPSHOT_FETCH_CONNECT_TIMEOUT`], so the old job of this
+/// value — "a generous deadline cannot park the sweep on one hung peer" — now
+/// belongs to those two. What is left for it to bound is a large but healthy
+/// body, and sizing it for a hung peer instead is what made a warm fleet
+/// unbootstrappable: measured on a 61-engine Kimi-K3 fleet, one snapshot was
+/// 40 MB gzipped / 208 MB inflated and took 17s to serve at HALF the tree size
+/// the fleet normally carries. Under the previous 30s value every fetch timed
+/// out, every peer was booked `Unreachable`, and the sweep abandoned all 61
+/// ranks — a failure that got MORE likely the warmer (i.e. more useful) the
+/// fleet's tree became.
+pub const DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP: Duration = Duration::from_secs(120);
+
+/// Bound on establishing the connection to a peer. A peer that is gone answers
+/// this fast, so the sweep reaches its next candidate without spending the
+/// per-fetch budget on a dead one.
+pub const SNAPSHOT_FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on the gap BETWEEN body chunks, not on the whole response.
+///
+/// This is what separates "hung" from "big". A total-request timeout cannot
+/// tell them apart: it fires identically on a peer that sent nothing for 30s
+/// and on one that streamed 40 MB perfectly for 31s. Bounding idle time
+/// instead lets an arbitrarily large healthy snapshot complete while still
+/// cutting a stalled peer loose in seconds.
+pub const SNAPSHOT_FETCH_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Hard bound on the seed-required readiness gate, derived from the bootstrap
+/// budget rather than configured separately.
+///
+/// Three times the budget: long enough that a sweep which is merely slow (a
+/// large snapshot, a peer that had to rebuild its export) still finishes inside
+/// the gate and the replica joins warm, short enough that the pathological case
+/// the gate cannot distinguish — a simultaneous fleet-wide restart, where every
+/// sibling is booting and no sweep can succeed — degrades to a bounded delay
+/// instead of an outage with no exit. Floored so a tiny budget still leaves a
+/// usable window.
+fn seed_gate_timeout(bootstrap_timeout: Duration) -> Duration {
+    (bootstrap_timeout * 3).max(Duration::from_secs(60))
+}
 
 /// Per-rank bootstrap outcome.
 ///
@@ -928,6 +969,35 @@ pub struct BootstrapTracker {
     /// sibling proved empty" from "burned the whole deadline" — both end in
     /// `RankOutcome::Abandoned` — so the sweep's own verdict gets a counter.
     sweep_results: Mutex<HashMap<&'static str, u64>>,
+    /// Whether a failed seed should hold `/readyz` at 503 (`--kv-bootstrap-seed-required`).
+    seed_required: bool,
+    /// Set when a sweep ended [`SweepOutcome::TimedOut`] over a NON-EMPTY
+    /// candidate set; cleared by a later sweep that finds a snapshot.
+    ///
+    /// Only `TimedOut` sets it, and that exclusion is the whole safety
+    /// argument. `NoPeers` (first deploy, single replica) and `FleetCold`
+    /// (every sibling PROVED it holds nothing) are legitimate "nothing to
+    /// inherit" verdicts; gating on them would brick a first deploy and a
+    /// cold fleet respectively, and because an unready replica leaves its own
+    /// EndpointSlice, every sibling would then see an empty peer set — a
+    /// fleet-wide deadlock with no automatic way out. `TimedOut` over a
+    /// non-empty candidate set is the one verdict that means "siblings were
+    /// there and we failed to get their state".
+    seed_failed: AtomicBool,
+    /// Hard bound on how long [`Self::seed_gate_open`] may hold readiness down.
+    ///
+    /// Without it the gate is a fleet-wide deadlock waiting for a simultaneous
+    /// restart: every peer is then booting, none is `producer_ready`, none is
+    /// provably cold either, so every sweep ends `TimedOut` and no replica
+    /// would ever serve. Armed at construction like [`Self::deadline`], for the
+    /// same reason spelled out there.
+    seed_gate_deadline: Mutex<Option<Instant>>,
+    /// Latched once this replica has served a 200 from `/readyz`.
+    ///
+    /// After that the seed gate is permanently open: a worker discovered later
+    /// can start a fresh sweep, and letting that drag an already-serving
+    /// replica back to 503 is the exact hazard `settled()` latches to avoid.
+    seed_gate_passed: AtomicBool,
 }
 
 impl BootstrapTracker {
@@ -936,6 +1006,12 @@ impl BootstrapTracker {
     }
 
     pub fn new_with_fetch_cap(timeout: Duration, fetch_cap: Duration) -> Self {
+        Self::new_with_opts(timeout, fetch_cap, false)
+    }
+
+    /// `seed_required`: hold `/readyz` at 503 when a sweep proves siblings were
+    /// present and their state could not be pulled. See [`Self::seed_gate_open`].
+    pub fn new_with_opts(timeout: Duration, fetch_cap: Duration, seed_required: bool) -> Self {
         Self {
             fetch_cap,
             states: Mutex::new(HashMap::new()),
@@ -963,6 +1039,12 @@ impl BootstrapTracker {
             rank_outcomes: Mutex::new(HashMap::new()),
             peer_attempts: Mutex::new(HashMap::new()),
             sweep_results: Mutex::new(HashMap::new()),
+            seed_required,
+            seed_failed: AtomicBool::new(false),
+            // Armed at construction, for the reason spelled out on `deadline`
+            // above: an unarmed clock here is a permanent gate.
+            seed_gate_deadline: Mutex::new(Some(Instant::now() + seed_gate_timeout(timeout))),
+            seed_gate_passed: AtomicBool::new(false),
         }
     }
 
@@ -1043,12 +1125,74 @@ impl BootstrapTracker {
 
     /// Tally one peer sweep's terminal verdict. Called once per sweep, from
     /// the delivery point, so the counts sum to the number of sweeps run.
-    pub fn record_sweep_result(&self, result: SweepOutcome) {
+    ///
+    /// `peers_tried` is the size of the candidate set the verdict was proven
+    /// over. It is what separates a `TimedOut` that means "siblings were there
+    /// and we could not get their state" from one over an empty candidate set,
+    /// which means only that discovery had not caught up — see
+    /// [`Self::seed_gate_open`].
+    pub fn record_sweep_result(&self, result: SweepOutcome, peers_tried: usize) {
         *self
             .sweep_results
             .lock()
             .entry(result.as_label())
             .or_insert(0) += 1;
+        match result {
+            SweepOutcome::TimedOut if peers_tried > 0 => {
+                self.seed_failed.store(true, Ordering::Relaxed);
+            }
+            // A later sweep that lands clears the mark: a rank discovered after
+            // the failure must be able to un-fail the replica, or one unlucky
+            // sweep would gate a pod that went on to seed perfectly.
+            SweepOutcome::Found => self.seed_failed.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+
+    /// Whether readiness may proceed despite the seed outcome — `true` means
+    /// "do not hold traffic off this replica".
+    ///
+    /// Open unless ALL of: the gate is configured on, a sweep ended
+    /// [`SweepOutcome::TimedOut`] over a non-empty candidate set, this replica
+    /// has never yet served a ready 200, and the hard bound has not expired.
+    ///
+    /// The point is to make a failed seed abort a rolling update instead of
+    /// silently degrading it: a replica that could not pull the fleet's tree
+    /// routes cache-blind, and a NotReady pod is absent from the Service, so
+    /// the Deployment stalls with the previous generation still serving rather
+    /// than replacing it with cache-blind replicas.
+    pub fn seed_gate_open(&self) -> bool {
+        if !self.seed_required || self.seed_gate_passed.load(Ordering::Relaxed) {
+            return true;
+        }
+        if !self.seed_failed.load(Ordering::Relaxed) {
+            return true;
+        }
+        let expired = self
+            .seed_gate_deadline
+            .lock()
+            .is_some_and(|d| Instant::now() >= d);
+        if expired {
+            // Latch, so the warning fires once rather than per probe.
+            self.seed_gate_passed.store(true, Ordering::Relaxed);
+            warn!(
+                "kv-bootstrap: seed-required gate expired with no usable peer snapshot;                  serving cache-blind rather than holding this replica out forever",
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Latch the seed gate permanently open. Called the first time `/readyz`
+    /// answers 200, so a sweep started by a later worker discovery can never
+    /// drag an already-serving replica back out of the Service.
+    pub fn mark_seed_gate_passed(&self) {
+        self.seed_gate_passed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a sweep has recorded a failed seed. Test/metrics-facing.
+    pub fn seed_failed(&self) -> bool {
+        self.seed_failed.load(Ordering::Relaxed)
     }
 
     /// Per-sweep-verdict tallies for the metrics surface.
@@ -2134,5 +2278,183 @@ mod tests {
         assert_eq!(decoded.cursors, snap.cursors);
         assert_eq!(decoded.workers, snap.workers);
         assert!(decoded.is_bigram);
+    }
+
+    // ── seed-required readiness gate ─────────────────────────────────────────
+    //
+    // The gate exists so a replica that could not pull the fleet's tree is held
+    // OUT of the Service, which stalls a rolling update instead of completing
+    // it with cache-blind replicas. Every assertion below is about WHICH sweep
+    // verdict is allowed to do that, because the wrong answer in either
+    // direction is silent: gate too little and a bad rollout ships, gate too
+    // much and the fleet deadlocks with no automatic way out.
+
+    fn seeded_tracker() -> BootstrapTracker {
+        BootstrapTracker::new_with_opts(
+            Duration::from_secs(300),
+            DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            true,
+        )
+    }
+
+    /// The two verdicts that must NEVER gate, asserted over the class rather
+    /// than one example: `NoPeers` is a first deploy or a single replica, and
+    /// `FleetCold` is every sibling having PROVED it holds nothing. Gating on
+    /// either bricks a boot that has nothing to inherit — and because an
+    /// unready replica leaves its own EndpointSlice, every sibling then sees an
+    /// empty peer set and the whole fleet deadlocks.
+    #[test]
+    fn seed_gate_never_closes_on_a_nothing_to_inherit_verdict() {
+        for verdict in [SweepOutcome::NoPeers, SweepOutcome::FleetCold] {
+            let t = seeded_tracker();
+            t.record_sweep_result(verdict, 9);
+            assert!(
+                t.seed_gate_open(),
+                "{:?} means there was no state to inherit, not a failed seed; \
+                 gating on it deadlocks a cold fleet",
+                verdict.as_label(),
+            );
+            assert!(!t.seed_failed());
+        }
+    }
+
+    /// `TimedOut` gates only when the candidate set was non-empty. Over zero
+    /// peers it means discovery had not caught up, which is not evidence that
+    /// anyone had state to give.
+    #[test]
+    fn seed_gate_closes_only_on_timed_out_over_a_non_empty_candidate_set() {
+        let empty = seeded_tracker();
+        empty.record_sweep_result(SweepOutcome::TimedOut, 0);
+        assert!(
+            empty.seed_gate_open(),
+            "a timeout over zero candidates is a discovery race, not a failed seed",
+        );
+
+        let peers = seeded_tracker();
+        peers.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(
+            !peers.seed_gate_open(),
+            "siblings were present and their tree could not be pulled — this is \
+             the one verdict that must hold readiness down",
+        );
+    }
+
+    /// A later sweep that lands must un-fail the replica, or one unlucky sweep
+    /// gates a pod that went on to seed perfectly.
+    #[test]
+    fn seed_gate_reopens_when_a_later_sweep_finds_a_snapshot() {
+        let t = seeded_tracker();
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(!t.seed_gate_open());
+        t.record_sweep_result(SweepOutcome::Found, 1);
+        assert!(t.seed_gate_open(), "a successful sweep clears the failure");
+        assert!(!t.seed_failed());
+    }
+
+    /// Off by default: the same failing sweep must not gate a tracker that did
+    /// not opt in.
+    #[test]
+    fn seed_gate_is_inert_unless_required() {
+        let t = BootstrapTracker::new_with_opts(
+            Duration::from_secs(300),
+            DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            false,
+        );
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(t.seed_failed(), "the failure is still recorded");
+        assert!(
+            t.seed_gate_open(),
+            "but it must not hold readiness unless --kv-bootstrap-seed-required",
+        );
+    }
+
+    /// Once the replica has served a ready 200, a sweep started by a
+    /// late-discovered worker must not drag it back out of the Service — the
+    /// same hazard `settled()` latches to avoid.
+    #[test]
+    fn seed_gate_latches_open_once_readiness_has_passed() {
+        let t = seeded_tracker();
+        t.mark_seed_gate_passed();
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(
+            t.seed_gate_open(),
+            "an already-serving replica may not be un-readied by a later sweep",
+        );
+    }
+
+    /// The hard bound is what makes the gate safe at all: a simultaneous
+    /// fleet-wide restart has every sibling booting, so no sweep can succeed
+    /// and every one ends `TimedOut` over a non-empty set. Without the bound
+    /// that is a permanent fleet-wide outage.
+    #[test]
+    fn seed_gate_opens_when_the_hard_bound_expires() {
+        // A zero bootstrap budget floors the gate window, so drive expiry by
+        // hand rather than sleeping out the floor.
+        let t = seeded_tracker();
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(!t.seed_gate_open(), "closed while the bound holds");
+        *t.seed_gate_deadline.lock() = Some(Instant::now() - Duration::from_secs(1));
+        assert!(
+            t.seed_gate_open(),
+            "the bound must expire the gate; a gate with no exit is worse than \
+             the degradation it prevents",
+        );
+    }
+
+    /// A tracker that never bootstraps cannot have failed to.
+    ///
+    /// This holds because [`BootstrapTracker::disabled`] routes through
+    /// `new_with_opts(.., seed_required: false)` — there is deliberately no
+    /// second mechanism. An earlier draft also latched `seed_gate_passed` here;
+    /// mutating that line away left this test green, which is the signal that
+    /// it was redundant rather than defensive, so it was removed instead of
+    /// kept as an unbindable guard.
+    #[test]
+    fn disabled_tracker_never_gates() {
+        let t = BootstrapTracker::disabled();
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(t.seed_gate_open());
+    }
+
+    /// The three fetch bounds have to stay ordered, because the whole fix is
+    /// that they answer different questions: a peer that never answers
+    /// (connect) and one that stalls mid-body (read) are cut loose in seconds,
+    /// which is what lets the TOTAL be generous enough for a large healthy
+    /// snapshot. Collapse read or connect up to the total and the total goes
+    /// back to being the de-facto hang detector — the shape that made a warm
+    /// fleet unbootstrappable.
+    #[test]
+    fn fetch_bounds_separate_hung_from_big() {
+        assert!(
+            SNAPSHOT_FETCH_CONNECT_TIMEOUT < DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "connect must cut a dead peer long before the total bound",
+        );
+        assert!(
+            SNAPSHOT_FETCH_READ_TIMEOUT < DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "an idle bound above the total can never fire, leaving the total as \
+             the hang detector again",
+        );
+        // 40 MB gzipped / 208 MB inflated / 17s measured on a 61-engine
+        // Kimi-K3 fleet at HALF its usual tree; the cap has to clear a
+        // full-size body with headroom, not merely the measurement.
+        assert!(
+            DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP >= Duration::from_secs(90),
+            "a cap this side of ~90s cannot seed a warm fleet",
+        );
+    }
+
+    /// The window scales with the budget and is floored, so a tiny budget still
+    /// leaves room for a sweep that is merely slow.
+    #[test]
+    fn seed_gate_timeout_scales_and_floors() {
+        assert_eq!(
+            seed_gate_timeout(Duration::from_secs(300)),
+            Duration::from_secs(900),
+        );
+        assert_eq!(
+            seed_gate_timeout(Duration::from_secs(1)),
+            Duration::from_secs(60),
+            "floored, or a short budget makes the gate unobservably brief",
+        );
     }
 }

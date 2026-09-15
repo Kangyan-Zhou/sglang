@@ -120,12 +120,11 @@ async fn main() -> Result<()> {
         _ => None,
     };
     let kv_bootstrap = Arc::new(match (&cfg.model.cache_aware, &kv_peer_selector) {
-        (Some(ca), Some(_)) => {
-            sgl_router::policies::kv_events::BootstrapTracker::new_with_fetch_cap(
-                std::time::Duration::from_millis(ca.bootstrap_timeout_ms),
-                std::time::Duration::from_millis(ca.bootstrap_fetch_timeout_cap_ms),
-            )
-        }
+        (Some(ca), Some(_)) => sgl_router::policies::kv_events::BootstrapTracker::new_with_opts(
+            std::time::Duration::from_millis(ca.bootstrap_timeout_ms),
+            std::time::Duration::from_millis(ca.bootstrap_fetch_timeout_cap_ms),
+            ca.bootstrap_seed_required,
+        ),
         _ => sgl_router::policies::kv_events::BootstrapTracker::disabled(),
     });
     let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_bootstrap(
