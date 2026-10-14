@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, Context, Result};
+
+// jemalloc, not glibc malloc: glibc keeps the arena memory freed after a burst
+// of large (multimodal) request bodies, so RSS ratchets up to each burst's
+// high-water mark and never comes back down; jemalloc returns it to the OS.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{

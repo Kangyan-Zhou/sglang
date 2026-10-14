@@ -240,7 +240,7 @@ impl PreparedRequest {
         }
         let body = match body {
             Some(body) if !rewrite => body,
-            _ => serde_json::to_vec(&value)
+            _ => exact_json(&value)
                 .map_err(|error| ApiError::Internal(error.into()))?
                 .into(),
         };
@@ -309,7 +309,7 @@ impl PreparedRequest {
         let takes_ids = !(batch && path == CLASSIFY_PATH);
         if let Some(ids) = text_ids.as_ref().filter(|_| forward && takes_ids) {
             value["input"] = if batch { json!(ids) } else { json!(ids[0]) };
-            body = serde_json::to_vec(&value)
+            body = exact_json(&value)
                 .map_err(|error| ApiError::Internal(error.into()))?
                 .into();
         }
@@ -1063,10 +1063,20 @@ fn build_outgoing_body(
         body_fields.insert("bootstrap_port".into(), json!(bootstrap.port));
         body_fields.insert("bootstrap_room".into(), json!(bootstrap.room));
     }
-    let bytes = serde_json::to_vec(&body_fields).map_err(|e| {
+    let bytes = exact_json(&body_fields).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
     })?;
     Ok(Bytes::from(bytes))
+}
+
+/// Serialize a request body into an exactly-sized buffer. Request bodies live
+/// until the dispatch returns (a whole generation, for a non-streaming request)
+/// and a multimodal one runs to MiBs, so the `Vec`'s doubling slack (up to the
+/// body's size again) must not ride along with it.
+fn exact_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.shrink_to_fit();
+    Ok(bytes)
 }
 
 /// Forward generated IDs only for request shapes verified against the engine.
@@ -1326,6 +1336,17 @@ fn invalid_request() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_json_leaves_no_doubling_slack() {
+        // A ~3 MiB base64 image: big enough that `to_vec`'s growth overshoots.
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "x".repeat(3 * 1024 * 1024 + 12_345)}}
+        ]}]});
+        let bytes = exact_json(&body).unwrap();
+        assert_eq!(bytes.capacity(), bytes.len());
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), body);
+    }
     use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
 
