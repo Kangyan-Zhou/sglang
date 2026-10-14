@@ -1073,10 +1073,8 @@ fn build_outgoing_body(
 /// until the dispatch returns (a whole generation, for a non-streaming request)
 /// and a multimodal one runs to MiBs, so the `Vec`'s doubling slack (up to the
 /// body's size again) must not ride along with it.
-fn exact_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.shrink_to_fit();
-    Ok(bytes)
+pub(crate) fn exact_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Box<[u8]>> {
+    serde_json::to_vec(value).map(Vec::into_boxed_slice)
 }
 
 /// Forward generated IDs only for request shapes verified against the engine.
@@ -1336,19 +1334,33 @@ fn invalid_request() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn exact_json_leaves_no_doubling_slack() {
-        // A ~3 MiB base64 image: big enough that `to_vec`'s growth overshoots.
-        let body = json!({"messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "x".repeat(3 * 1024 * 1024 + 12_345)}}
-        ]}]});
-        let bytes = exact_json(&body).unwrap();
-        assert_eq!(bytes.capacity(), bytes.len());
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), body);
-    }
     use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
+
+    /// Whether `body`'s buffer is exactly its length; the caller must hold the
+    /// only handle to it.
+    fn is_exact(body: Bytes) -> bool {
+        let body = body.try_into_mut().expect("the test holds the only handle");
+        body.capacity() == body.len()
+    }
+
+    /// ~3 MiB: past the size where `to_vec`'s doubling overshoots.
+    fn big_payload() -> String {
+        "x".repeat(3 * 1024 * 1024 + 12_345)
+    }
+
+    #[test]
+    fn rewritten_request_bodies_carry_no_doubling_slack() {
+        // A `/generate` body re-serialized because its text became input_ids.
+        let mut generate =
+            prepare_generate(json!({"text": "hi", "sampling_params": {"stop": [big_payload()]}}));
+        assert!(serde_json::from_slice::<Value>(&generate.body).unwrap()["text"].is_null());
+        assert!(is_exact(std::mem::take(&mut generate.body)));
+        // The engine body each dispatch attempt builds.
+        let body = Bytes::from(json!({"messages": [], "pad": big_payload()}).to_string());
+        let out = build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, &[], None).unwrap();
+        assert!(is_exact(out));
+    }
 
     #[test]
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {

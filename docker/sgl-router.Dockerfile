@@ -66,6 +66,11 @@ WORKDIR /work/experimental/sgl-router
 # it statically, keeping the runtime self-contained.
 ENV PCRE2_SYS_STATIC=1
 
+# jemalloc fixes its page size at build time from the BUILD host, and an image
+# built on a 4 KiB-page arm64 host aborts at its first allocation on a 64 KiB-page
+# kernel. arm64 builds therefore assume 64 KiB, which also runs on 4 KiB kernels.
+ARG TARGETARCH
+
 COPY --from=chef /work/experimental/sgl-router/recipe.json ./recipe.json
 COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 # The recipe omits path dependencies outside this workspace, so cook against a
@@ -77,7 +82,8 @@ RUN mkdir -p /work/rust/sglang-processor/src && touch /work/rust/sglang-processo
 # Cook (compile + cache) the dep graph from the recipe. The recipe carries every
 # workspace member's manifest and the lockfile, so chef recreates the Indexer's
 # source stubs itself.
-RUN cargo chef cook --locked --release --recipe-path recipe.json
+RUN case "${TARGETARCH:-$(uname -m)}" in arm64|aarch64) export JEMALLOC_SYS_WITH_LG_PAGE=16 ;; esac \
+    && cargo chef cook --locked --release --recipe-path recipe.json
 
 # Now bring in the real sources and the manifests they need.
 COPY experimental/sgl-router/Cargo.toml experimental/sgl-router/Cargo.lock ./
@@ -88,7 +94,8 @@ COPY experimental/sgl-router/sgl-kv-indexer/proto sgl-kv-indexer/proto
 COPY experimental/sgl-router/sgl-kv-indexer/src sgl-kv-indexer/src
 COPY rust/sglang-processor/src /work/rust/sglang-processor/src
 
-RUN touch sgl-kv-indexer/build.rs /work/rust/sglang-processor/src/lib.rs \
+RUN case "${TARGETARCH:-$(uname -m)}" in arm64|aarch64) export JEMALLOC_SYS_WITH_LG_PAGE=16 ;; esac \
+    && touch sgl-kv-indexer/build.rs /work/rust/sglang-processor/src/lib.rs \
     && cargo build --locked --release --bin sgl-router \
     && strip target/release/sgl-router
 

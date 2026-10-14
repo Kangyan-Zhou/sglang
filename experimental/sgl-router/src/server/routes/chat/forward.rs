@@ -176,6 +176,9 @@ pub(super) async fn forward_request(
                 None,
             )
         };
+    // The per-worker bodies are built; under dp-aware routing they are spliced
+    // copies, so don't hold this one across the whole generation as well.
+    drop(body);
 
     // In PD mode, prefill can finish before decode. Watch the registration
     // held by the response so expiration remains live for its full lifetime.

@@ -2,13 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, Context, Result};
-
-// jemalloc, not glibc malloc: glibc keeps the arena memory freed after a burst
-// of large (multimodal) request bodies, so RSS ratchets up to each burst's
-// high-water mark and never comes back down; jemalloc returns it to the OS.
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
@@ -44,6 +37,15 @@ use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
 };
+
+// jemalloc, not glibc malloc: glibc keeps the arena memory freed after a burst
+// of large (multimodal) request bodies, so RSS ratchets up to each burst's
+// high-water mark and never comes back down, while jemalloc decays freed pages
+// back to the OS (from background threads on Linux). Its symbols are prefixed,
+// so runtime tuning goes through `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Heartbeat escalates INFO -> WARN here: earlier is a routine rollout draining

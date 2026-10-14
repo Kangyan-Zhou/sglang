@@ -24,6 +24,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
+pub(crate) use preparation::exact_json;
 use preparation::{
     parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
     COMPLETIONS_PATH, EMBEDDINGS_PATH,

@@ -20,7 +20,7 @@ use crate::protocol::anthropic::{
 use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::routes::chat::{chat_completions, MAX_CHAT_BODY_BYTES};
+use crate::server::routes::chat::{chat_completions, exact_json, MAX_CHAT_BODY_BYTES};
 use crate::server::routes::tokenize::tokenizer_for;
 
 /// Upstream replies are buffered up to the same cap as requests.
@@ -35,12 +35,17 @@ pub(crate) async fn messages(
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
-    let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
+    let anthropic::Converted { chat, echo, stream } = converted;
+    let chat_body = Bytes::from(exact_json(&chat).expect("serialize chat"));
+    // The chat body is all the dispatch needs. Holding the Anthropic body and
+    // its conversion across the generation would keep two more copies of a
+    // possibly multi-MiB (image-carrying) request alive.
+    drop((chat, body));
     let resp = match chat_completions(State(ctx), headers, chat_body).await {
         Ok(r) => r,
         Err(e) => e.into_response(),
     };
-    adapt(resp, Some((converted.echo, converted.stream))).await
+    adapt(resp, Some((echo, stream))).await
 }
 
 /// Counted with the model's chat encoder; image tokens are not included.
