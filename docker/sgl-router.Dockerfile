@@ -66,12 +66,9 @@ WORKDIR /work/experimental/sgl-router
 # it statically, keeping the runtime self-contained.
 ENV PCRE2_SYS_STATIC=1
 
-# jemalloc fixes its page size at build time from the BUILD host, and an image
-# built on a 4 KiB-page arm64 host aborts at its first allocation on a 64 KiB-page
-# kernel. arm64 builds therefore assume 64 KiB, which also runs on 4 KiB kernels.
-ARG TARGETARCH
-
 COPY --from=chef /work/experimental/sgl-router/recipe.json ./recipe.json
+# Build-time env the dep cook needs too: jemalloc's page size on arm64.
+COPY experimental/sgl-router/.cargo ./.cargo
 COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 # The recipe omits path dependencies outside this workspace, so cook against a
 # stub of sglang-processor; its real sources arrive with the router's below.
@@ -82,8 +79,7 @@ RUN mkdir -p /work/rust/sglang-processor/src && touch /work/rust/sglang-processo
 # Cook (compile + cache) the dep graph from the recipe. The recipe carries every
 # workspace member's manifest and the lockfile, so chef recreates the Indexer's
 # source stubs itself.
-RUN case "${TARGETARCH:-$(uname -m)}" in arm64|aarch64) export JEMALLOC_SYS_WITH_LG_PAGE=16 ;; esac \
-    && cargo chef cook --locked --release --recipe-path recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json
 
 # Now bring in the real sources and the manifests they need.
 COPY experimental/sgl-router/Cargo.toml experimental/sgl-router/Cargo.lock ./
@@ -94,8 +90,7 @@ COPY experimental/sgl-router/sgl-kv-indexer/proto sgl-kv-indexer/proto
 COPY experimental/sgl-router/sgl-kv-indexer/src sgl-kv-indexer/src
 COPY rust/sglang-processor/src /work/rust/sglang-processor/src
 
-RUN case "${TARGETARCH:-$(uname -m)}" in arm64|aarch64) export JEMALLOC_SYS_WITH_LG_PAGE=16 ;; esac \
-    && touch sgl-kv-indexer/build.rs /work/rust/sglang-processor/src/lib.rs \
+RUN touch sgl-kv-indexer/build.rs /work/rust/sglang-processor/src/lib.rs \
     && cargo build --locked --release --bin sgl-router \
     && strip target/release/sgl-router
 

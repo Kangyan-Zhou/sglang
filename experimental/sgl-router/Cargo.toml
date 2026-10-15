@@ -99,6 +99,7 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 
 # Global allocator for the binary (see `src/main.rs`). Background purging
 # threads are Linux-only in jemalloc, so the feature is enabled there alone.
+# arm64 Linux builds pin jemalloc's page size in `.cargo/config.toml`.
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
