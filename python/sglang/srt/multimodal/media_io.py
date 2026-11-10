@@ -139,9 +139,9 @@ _DENIED_IPV4_NETWORKS = tuple(
 
 
 # IPv6 is allowlisted to global unicast; everything outside 2000::/3 (loopback,
-# unspecified, ULA fc00::/7, link-local fe80::/10, site-local fec0::/10,
-# multicast ff00::/8, discard 100::/64, local-use NAT64 64:ff9b:1::/48, ...)
-# is denied without being listed.
+# unspecified, deprecated IPv4-compatible ::/96, ULA fc00::/7, link-local
+# fe80::/10, site-local fec0::/10, multicast ff00::/8, discard 100::/64,
+# local-use NAT64 64:ff9b:1::/48, ...) is denied without being listed.
 _IPV6_GLOBAL_UNICAST = ipaddress.IPv6Network("2000::/3")
 _DENIED_IPV6_NETWORKS = tuple(
     ipaddress.IPv6Network(network)
@@ -151,22 +151,21 @@ _DENIED_IPV6_NETWORKS = tuple(
         "3fff::/20",  # documentation
     )
 )
-_IPV4_COMPATIBLE = ipaddress.IPv6Network("::/96")
 _NAT64_WELL_KNOWN = ipaddress.IPv6Network("64:ff9b::/96")
 
 
 def _embedded_ipv4(address: ipaddress.IPv6Address) -> Optional[ipaddress.IPv4Address]:
     """The IPv4 address an IPv6 address reaches, for the forms that embed one.
 
-    Covers IPv4-mapped (::ffff:0:0/96), deprecated IPv4-compatible (::/96),
-    well-known-prefix NAT64 (64:ff9b::/96) and 6to4 (2002::/16). A NAT64
+    Covers IPv4-mapped (::ffff:0:0/96), well-known-prefix NAT64
+    (64:ff9b::/96) and 6to4 (2002::/16). A NAT64
     gateway on a network-specific prefix (RFC 6052) cannot be recognized
     generically: such a deployment must block internal targets at the network
     layer.
     """
     if address.ipv4_mapped is not None:
         return address.ipv4_mapped
-    if address in _IPV4_COMPATIBLE or address in _NAT64_WELL_KNOWN:
+    if address in _NAT64_WELL_KNOWN:
         return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
     return address.sixtofour
 
