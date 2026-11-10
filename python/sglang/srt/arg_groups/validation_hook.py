@@ -124,6 +124,7 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "allowed_media_domains",
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
+    "media_url_allow_private_networks",
     "enable_trace",
     "warmups",
     "completion_template",

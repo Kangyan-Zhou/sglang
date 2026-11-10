@@ -149,6 +149,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.media_io import MediaLoadError
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
@@ -253,6 +254,23 @@ def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     )
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
+
+
+def _log_media_load_failure(request_obj, error: BaseException) -> None:
+    """Log a client media failure with its request id. The client sees only
+    the safe message; the reason (``log_detail``, URL already redacted) stays
+    server-side."""
+    cause: Optional[BaseException] = error
+    while cause is not None and not isinstance(cause, MediaLoadError):
+        cause = cause.__cause__
+    if cause is None:
+        return
+    logger.info(
+        "Media load failed: rid=%s error=%s reason=%s",
+        getattr(request_obj, "rid", None),
+        error,
+        cause.log_detail,
+    )
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -1162,6 +1180,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    async def _process_mm_data(self, obj, mm_processor_input):
+        try:
+            return await self.mm_processor.process_mm_data_async(
+                image_data=obj.image_data,
+                audio_data=obj.audio_data,
+                input_text=mm_processor_input,
+                request_obj=obj,
+                max_req_input_len=self.max_req_input_len,
+            )
+        except ValueError as e:
+            _log_media_load_failure(obj, e)
+            raise
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1289,13 +1320,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=mm_processor_input,
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
+                    mm_inputs = await self._process_mm_data(obj, mm_processor_input)
             elif (
                 get_disagg().language_only
                 and get_disagg().encoder_transfer_backend
@@ -1304,13 +1329,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
+                mm_inputs = await self._process_mm_data(obj, mm_processor_input)
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids

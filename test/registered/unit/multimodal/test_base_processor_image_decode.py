@@ -111,10 +111,12 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
             "sglang.srt.multimodal.processors.base_processor.load_image",
             side_effect=requests.ConnectionError("connection refused"),
         ):
-            with self.assertRaisesRegex(ValueError, "connection refused"):
+            with self.assertRaisesRegex(ValueError, "Failed to fetch media URL") as ctx:
                 _StubProcessor._load_single_item(
                     "https://127.0.0.1:1/not-an-image.png", Modality.IMAGE
                 )
+        # The connection outcome is a port-probing oracle; it stays server-side.
+        self.assertNotIn("connection refused", str(ctx.exception))
 
     def test_invalid_image_bytes_are_a_client_error(self):
         with self.assertRaisesRegex(ValueError, "cannot identify image file"):

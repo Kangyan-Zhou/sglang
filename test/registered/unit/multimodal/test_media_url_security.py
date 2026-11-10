@@ -5,9 +5,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
-import requests
-
 from sglang.srt.multimodal.media_io import (
+    MediaLoadError,
     _normalize_video_input,
     configure_media_url_security,
     download_remote_media,
@@ -91,9 +90,17 @@ class TestMediaURLSecurity(unittest.TestCase):
         cls.server.server_close()
         cls.thread.join()
 
+    # The fixture server listens on loopback, which the default address policy
+    # refuses (see test_media_url_address_policy.py), so these allowlist,
+    # redirect and size tests opt in to private networks.
+    def _configure(self, domains, max_file_size_mb=64):
+        configure_media_url_security(
+            domains, max_file_size_mb=max_file_size_mb, allow_private_networks=True
+        )
+
     def setUp(self):
         self.server.redirect_target_reached = False
-        configure_media_url_security([], max_file_size_mb=64)
+        self._configure([])
 
     def tearDown(self):
         configure_media_url_security([], max_file_size_mb=64)
@@ -108,7 +115,7 @@ class TestMediaURLSecurity(unittest.TestCase):
         )
 
     def test_exact_domain_allowlist(self):
-        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        self._configure(["127.0.0.1"])
         self.assertEqual(
             download_remote_media(self._url("/media"), timeout=5), b"remote-media"
         )
@@ -118,30 +125,31 @@ class TestMediaURLSecurity(unittest.TestCase):
             download_remote_media("http://169.254.169.254/latest/meta-data", timeout=5)
 
     def test_redirect_destination_is_checked_before_fetch(self):
-        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        self._configure(["127.0.0.1"])
         with self.assertRaisesRegex(ValueError, "not allowed"):
             download_remote_media(self._url("/other-host-redirect"), timeout=5)
         self.assertFalse(self.server.redirect_target_reached)
 
     def test_same_domain_redirect_is_allowed(self):
-        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        self._configure(["127.0.0.1"])
         self.assertEqual(
             download_remote_media(self._url("/same-host-redirect"), timeout=5),
             b"remote-media",
         )
 
     def test_redirect_count_is_bounded(self):
-        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
-        with self.assertRaises(requests.exceptions.TooManyRedirects):
+        self._configure(["127.0.0.1"])
+        with self.assertRaises(MediaLoadError) as ctx:
             download_remote_media(self._url("/redirect-loop"), timeout=5)
+        self.assertEqual(ctx.exception.log_detail, "too many redirects")
 
     def test_declared_oversized_response_is_rejected(self):
-        configure_media_url_security(["127.0.0.1"], max_file_size_mb=1)
+        self._configure(["127.0.0.1"], max_file_size_mb=1)
         with self.assertRaisesRegex(ValueError, "download limit"):
             download_remote_media(self._url("/oversized"), timeout=5)
 
     def test_streamed_oversized_response_is_rejected(self):
-        configure_media_url_security(["127.0.0.1"], max_file_size_mb=1)
+        self._configure(["127.0.0.1"], max_file_size_mb=1)
         with self.assertRaisesRegex(ValueError, "download limit"):
             download_remote_media(self._url("/chunked-oversized"), timeout=5)
 
@@ -157,7 +165,7 @@ class TestMediaURLSecurity(unittest.TestCase):
                     configure_media_url_security([domain], max_file_size_mb=64)
 
     def test_backslash_userinfo_parser_confusion_cannot_bypass_allowlist(self):
-        configure_media_url_security(["safe.example.org"], max_file_size_mb=64)
+        self._configure(["safe.example.org"])
         with self.assertRaisesRegex(ValueError, "not allowed"):
             download_remote_media(
                 r"https://evil.example\@safe.example.org/media", timeout=5

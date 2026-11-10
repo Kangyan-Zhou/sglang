@@ -5604,6 +5604,7 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
+        "media_url_allow_private_networks": ["--media-url-allow-private-networks"],
         "enable_trace": ["--enable-trace"],
         "warmups": ["--warmups", "voice_chat"],
         "completion_template": ["--completion-template", "deepseek_coder"],

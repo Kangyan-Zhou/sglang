@@ -24,7 +24,12 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
-from sglang.srt.multimodal.media_io import ImageData, VideoData, download_remote_media
+from sglang.srt.multimodal.media_io import (
+    ImageData,
+    MediaLoadError,
+    VideoData,
+    download_remote_media,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -830,6 +835,8 @@ class MiMoProcessor:
                     idx = future_to_idx[future]
                     try:
                         video_results[idx] = future.result()
+                    except MediaLoadError:
+                        raise  # a client error (400), already client-safe
                     except Exception as e:
                         raise RuntimeError(
                             f"Error processing video at index {idx}: {e}"

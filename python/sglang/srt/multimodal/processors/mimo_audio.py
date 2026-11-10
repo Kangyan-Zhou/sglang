@@ -196,14 +196,17 @@ class MiMoAudioPipeline:
                         if dl_elapsed_ms > 1000.0:
                             logger.warning(
                                 f"Slow audio download: {dl_elapsed_ms:.2f}ms, "
-                                f"size={len(content) / 1024:.1f}KB, url={audio}"
+                                f"size={len(content) / 1024:.1f}KB, "
+                                f"url={media_io.redact_media_url(audio)}"
                             )
                         file = io.BytesIO(content)
                     except Exception as e:
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
                         logger.error(
                             f"Failed to download audio: {dl_elapsed_ms:.2f}ms, "
-                            f"error={type(e).__name__}: {e}, url={audio}"
+                            f"error={type(e).__name__}: "
+                            f"{getattr(e, 'log_detail', '')}, "
+                            f"url={media_io.redact_media_url(audio)}"
                         )
                         raise
                 else:
@@ -216,7 +219,7 @@ class MiMoAudioPipeline:
                 samples = AudioDecoder(file).get_all_samples()
             except RuntimeError as e:
                 audio_source = (
-                    audio
+                    media_io.redact_media_url(audio)
                     if isinstance(audio, str)
                     and (audio.startswith("http://") or audio.startswith("https://"))
                     else "<bytes or base64>"

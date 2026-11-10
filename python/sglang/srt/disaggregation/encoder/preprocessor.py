@@ -29,9 +29,11 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 )
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
+    describe_media_item,
     load_audio,
     load_image,
     load_video,
+    media_error_client_text,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.glm4v import (
@@ -370,10 +372,16 @@ class EncoderPreprocessor:
             raise
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only
-            # MMError carries.
-            raise BadRequestError(f"Error while loading data {data}: {e}") from e
+            # MMError carries. The text reaches the client, so the URL is
+            # redacted and a fetch failure carries no connection detail.
+            raise BadRequestError(
+                f"Error while loading data {describe_media_item(data)}: "
+                f"{media_error_client_text(e)}"
+            ) from e
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            raise RuntimeError(
+                f"Error while loading data {describe_media_item(data)}: {e}"
+            )
 
     def _submit_data_loading_tasks(self, items, modalities):
         futures = []

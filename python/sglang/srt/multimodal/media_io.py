@@ -19,20 +19,28 @@ import ipaddress
 import logging
 import math
 import os
+import socket
 import threading
 import time
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
-from typing import Dict, Optional, Sequence, Union
-from urllib.parse import unquote, urljoin, urlparse
+from typing import Any, Dict, Optional, Sequence, Union
+from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
 import numpy as np
 import pybase64
 import requests
 import torch
 from PIL import Image, ImageOps, UnidentifiedImageError
+from requests.adapters import HTTPAdapter
 from typing_extensions import Literal
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
+from urllib3.exceptions import NewConnectionError
+from urllib3.util.connection import allowed_gai_family
 
 from sglang.srt.utils.device import is_cuda
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -56,6 +64,169 @@ _allowed_media_domains: frozenset[str] = frozenset()
 
 
 _media_url_max_file_size_bytes = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB * 1024 * 1024
+
+
+_media_url_allow_private_networks = False
+
+
+# Bumped by configure_media_url_security so per-thread sessions (and their
+# pooled connections, each validated under the policy in force when it opened)
+# are rebuilt after a policy change.
+_media_url_policy_generation = 0
+
+
+class MediaLoadError(ValueError):
+    """A client-supplied media item could not be loaded.
+
+    ``str()`` is returned to the client, so it never carries the underlying
+    exception text, a URL query or userinfo: whether a connection was refused,
+    timed out or returned an HTTP error would let a client probe ports and
+    services through the server. ``log_detail`` holds the server-side reason.
+    """
+
+    def __init__(
+        self,
+        message: str = "Failed to load media",
+        *,
+        log_detail: Optional[str] = None,
+        transient: bool = False,
+    ):
+        super().__init__(message)
+        self.log_detail = log_detail or message
+        # A connect or read failure that a retry may cure; never a refusal.
+        self.transient = transient
+
+
+class MediaURLNotAllowedError(MediaLoadError):
+    """The media URL is refused by policy, judged from the URL text alone
+    (scheme, domain allowlist, literal IP). A refusal that depends on what a
+    hostname resolves to is reported as a generic fetch failure instead, so the
+    error does not reveal which internal names exist."""
+
+
+class _MediaAddressBlockedError(MediaLoadError):
+    """Raised at connect time when no resolved address is public. Deriving
+    from ValueError (not OSError) keeps urllib3 from retrying or rewrapping it."""
+
+
+_MEDIA_FETCH_FAILED = "Failed to fetch media URL"
+
+
+# Explicit deny policy for the address a media download connects to. Do not
+# replace it with ipaddress.is_global/is_private: their classification has
+# changed across Python versions and reports several unroutable or internal
+# ranges (multicast, fec0::/10, 64:ff9b::/96, 192.88.99.0/24) as global.
+_DENIED_IPV4_NETWORKS = tuple(
+    ipaddress.IPv4Network(network)
+    for network in (
+        "0.0.0.0/8",  # "this network", includes the unspecified address
+        "10.0.0.0/8",  # private
+        "100.64.0.0/10",  # carrier-grade NAT
+        "127.0.0.0/8",  # loopback
+        "169.254.0.0/16",  # link-local, includes cloud metadata services
+        "172.16.0.0/12",  # private
+        "192.0.0.0/24",  # IETF protocol assignments
+        "192.0.2.0/24",  # documentation
+        "192.88.99.0/24",  # deprecated 6to4 relay anycast
+        "192.168.0.0/16",  # private
+        "198.18.0.0/15",  # benchmarking
+        "198.51.100.0/24",  # documentation
+        "203.0.113.0/24",  # documentation
+        "224.0.0.0/4",  # multicast
+        "240.0.0.0/4",  # reserved, includes the 255.255.255.255 broadcast
+    )
+)
+
+
+# IPv6 is allowlisted to global unicast; everything outside 2000::/3 (loopback,
+# unspecified, ULA fc00::/7, link-local fe80::/10, site-local fec0::/10,
+# multicast ff00::/8, discard 100::/64, local-use NAT64 64:ff9b:1::/48, ...)
+# is denied without being listed.
+_IPV6_GLOBAL_UNICAST = ipaddress.IPv6Network("2000::/3")
+_DENIED_IPV6_NETWORKS = tuple(
+    ipaddress.IPv6Network(network)
+    for network in (
+        "2001::/23",  # IETF protocol assignments, includes Teredo 2001::/32
+        "2001:db8::/32",  # documentation
+        "3fff::/20",  # documentation
+    )
+)
+_IPV4_COMPATIBLE = ipaddress.IPv6Network("::/96")
+_NAT64_WELL_KNOWN = ipaddress.IPv6Network("64:ff9b::/96")
+
+
+def _embedded_ipv4(address: ipaddress.IPv6Address) -> Optional[ipaddress.IPv4Address]:
+    """The IPv4 address an IPv6 address reaches, for the forms that embed one.
+
+    Covers IPv4-mapped (::ffff:0:0/96), deprecated IPv4-compatible (::/96),
+    well-known-prefix NAT64 (64:ff9b::/96) and 6to4 (2002::/16). A NAT64
+    gateway on a network-specific prefix (RFC 6052) cannot be recognized
+    generically: such a deployment must block internal targets at the network
+    layer.
+    """
+    if address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    if address in _IPV4_COMPATIBLE or address in _NAT64_WELL_KNOWN:
+        return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    return address.sixtofour
+
+
+def is_public_media_address(address: str) -> bool:
+    """Whether a media download may connect to ``address`` (an IP literal)."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is None:
+            return ip in _IPV6_GLOBAL_UNICAST and not any(
+                ip in network for network in _DENIED_IPV6_NETWORKS
+            )
+        ip = embedded
+    return not any(ip in network for network in _DENIED_IPV4_NETWORKS)
+
+
+def redact_media_url(url: Any, max_len: int = 100) -> str:
+    """Render a client media reference for logs and error text.
+
+    Drops URL userinfo, query and fragment (signed URLs carry credentials
+    there) and truncates the rest.
+    """
+    if not isinstance(url, str):
+        return f"<{type(url).__name__}>"
+    if url.startswith("data:"):
+        return url.split(",", 1)[0][:max_len] + ",..."
+    if url.startswith(("http://", "https://")):
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname or ""
+            port = parsed.port
+        except ValueError:
+            return "<invalid media URL>"
+        if ":" in host:
+            host = f"[{host}]"
+        rendered = f"{parsed.scheme}://{host}"
+        if port is not None:
+            rendered += f":{port}"
+        rendered += parsed.path
+        if parsed.query or parsed.fragment:
+            rendered += "?<redacted>"
+    else:
+        rendered = url  # a local path or inline payload
+    if len(rendered) > max_len:
+        rendered = rendered[:max_len] + "..."
+    return rendered
+
+
+def describe_media_item(data: Any) -> str:
+    """A short, credential-free description of one media input."""
+    url = getattr(data, "url", None)
+    if isinstance(url, str):
+        data = url
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return f"<{len(data)} bytes>"
+    return redact_media_url(data)
 
 
 def _normalize_media_domain(domain: str) -> str:
@@ -93,6 +264,7 @@ def _normalize_media_domain(domain: str) -> str:
 def configure_media_url_security(
     allowed_media_domains: Optional[Sequence[str]] = None,
     max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+    allow_private_networks: bool = False,
 ) -> list[str]:
     """Configure process-wide safeguards for client-supplied media URLs.
 
@@ -108,37 +280,217 @@ def configure_media_url_security(
         {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
     )
     global _allowed_media_domains, _media_url_max_file_size_bytes
+    global _media_url_allow_private_networks, _media_url_policy_generation
     _allowed_media_domains = frozenset(normalized_domains)
     _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
+    _media_url_allow_private_networks = bool(allow_private_networks)
+    _media_url_policy_generation += 1
     return normalized_domains
 
 
 def _assert_media_url_allowed(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-        raise ValueError(f"Invalid media URL: {url!r}")
+        raise MediaURLNotAllowedError(
+            "Invalid media URL", log_detail=f"invalid URL {redact_media_url(url)}"
+        )
 
-    hostname = _normalize_media_domain(parsed.hostname)
+    try:
+        hostname = _normalize_media_domain(parsed.hostname)
+    except ValueError as e:
+        raise MediaURLNotAllowedError(
+            "Invalid media URL",
+            log_detail=f"invalid hostname in {redact_media_url(url)}",
+        ) from e
     if _allowed_media_domains and hostname not in _allowed_media_domains:
-        raise ValueError(
+        raise MediaURLNotAllowedError(
             "Media URL domain is not allowed. "
             f"Allowed domains: {sorted(_allowed_media_domains)}; "
             f"input domain: {hostname}"
         )
+    # A literal IP is refused here, before any connection, with a specific
+    # message: the client typed the address, so naming it leaks nothing.
+    # Hostnames are checked at connect time (_GuardedConnectionMixin).
+    if not _media_url_allow_private_networks:
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            return
+        if not is_public_media_address(hostname):
+            raise MediaURLNotAllowedError(
+                "Media URL is not allowed: the address is not public"
+            )
+
+
+def _connect_public_address(conn: HTTPConnection) -> socket.socket:
+    """Resolve ``conn``'s host once, keep only addresses the media policy
+    allows, and connect to one of those exact addresses.
+
+    Resolving here and connecting to the validated sockaddr (instead of
+    checking a name and letting the socket layer resolve it again) is what
+    defeats DNS rebinding. TLS SNI, certificate verification and the Host
+    header still use ``conn.host``.
+    """
+    host = getattr(conn, "_dns_host", conn.host).strip("[]")
+    try:
+        infos = socket.getaddrinfo(
+            host, conn.port, allowed_gai_family(), socket.SOCK_STREAM
+        )
+    except socket.gaierror as e:
+        raise NewConnectionError(conn, f"Failed to resolve media host: {e}") from e
+
+    allow_all = _media_url_allow_private_networks
+    candidates = []
+    blocked = []
+    for family, socktype, proto, _, sockaddr in infos:
+        if allow_all or is_public_media_address(sockaddr[0]):
+            candidates.append((family, socktype, proto, sockaddr))
+        else:
+            blocked.append(sockaddr[0])
+    if not candidates:
+        raise _MediaAddressBlockedError(
+            _MEDIA_FETCH_FAILED,
+            log_detail=(
+                f"host {host!r} resolved only to non-public addresses "
+                f"{sorted(set(blocked))}; set --media-url-allow-private-networks "
+                "to fetch media from internal hosts"
+            ),
+        )
+
+    last_error: Optional[OSError] = None
+    for family, socktype, proto, sockaddr in candidates:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            for option in conn.socket_options or ():
+                sock.setsockopt(*option)
+            if isinstance(conn.timeout, (int, float)):
+                sock.settimeout(conn.timeout)
+            if conn.source_address:
+                sock.bind(conn.source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as e:
+            sock.close()
+            last_error = e
+    if isinstance(last_error, socket.timeout):
+        raise ConnectTimeoutError(
+            conn, f"Connection to {conn.host} timed out"
+        ) from last_error
+    raise NewConnectionError(
+        conn, f"Failed to establish a new connection: {last_error}"
+    ) from last_error
+
+
+class _GuardedConnectionMixin:
+    def _new_conn(self) -> socket.socket:
+        return _connect_public_address(self)
+
+
+class _GuardedHTTPConnection(_GuardedConnectionMixin, HTTPConnection):
+    pass
+
+
+class _GuardedHTTPSConnection(_GuardedConnectionMixin, HTTPSConnection):
+    pass
+
+
+class _GuardedHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _GuardedHTTPConnection
+
+
+class _GuardedHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _GuardedHTTPSConnection
+
+
+class _MediaHTTPAdapter(HTTPAdapter):
+    """Opens every connection, pooled or new, HTTP or HTTPS, through the
+    connect-time address check."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _GuardedHTTPConnectionPool,
+            "https": _GuardedHTTPSConnectionPool,
+        }
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        # Through a proxy the check would vet the proxy, not the target.
+        raise _MediaAddressBlockedError(
+            _MEDIA_FETCH_FAILED, log_detail="proxies are not used for media URLs"
+        )
+
+
+def _describe_fetch_failure(error: BaseException) -> str:
+    """A server-side reason for a failed download. Built from the exception
+    type and status, never ``str(error)``: requests and urllib3 messages embed
+    the request path and query."""
+    if isinstance(error, MediaLoadError):
+        return error.log_detail
+    if isinstance(error, requests.exceptions.HTTPError):
+        status = getattr(error.response, "status_code", None)
+        return f"HTTP status {status}"
+    if isinstance(error, requests.exceptions.SSLError):
+        return "TLS error"
+    if isinstance(error, requests.exceptions.Timeout):
+        return "timed out"
+    if isinstance(error, requests.exceptions.TooManyRedirects):
+        return "too many redirects"
+    cause: Optional[BaseException] = error
+    seen = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, OSError) and cause.strerror:
+            return f"{type(error).__name__} ({cause.strerror})"
+        cause = cause.__cause__ or cause.__context__
+    return type(error).__name__
 
 
 def download_remote_media(url: str, timeout: float) -> bytes:
     """Download one HTTP(S) media object under the configured URL policy.
 
     Redirects are followed manually so every destination is validated before
-    a connection is made. The response is streamed to enforce both the total
-    request deadline and the configured byte limit without first buffering an
-    attacker-controlled body in memory.
+    a connection is made, and every connection goes through the connect-time
+    address check of ``get_mm_http_session``. The response is streamed to
+    enforce both the total request deadline and the configured byte limit
+    without first buffering an attacker-controlled body in memory.
+
+    Every failure is raised as ``MediaLoadError`` with a client-safe message;
+    the reason is logged here with the URL redacted.
     """
 
     if timeout <= 0:
         raise ValueError("media URL timeout must be positive")
 
+    try:
+        return _download_remote_media(url, timeout)
+    except MediaLoadError as e:
+        _log_media_fetch_failure(url, e)
+        raise
+    except (requests.exceptions.RequestException, Urllib3HTTPError, OSError) as e:
+        error = MediaLoadError(
+            _MEDIA_FETCH_FAILED,
+            log_detail=_describe_fetch_failure(e),
+            transient=isinstance(
+                e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+            )
+            and not isinstance(e, requests.exceptions.SSLError),
+        )
+        _log_media_fetch_failure(url, error)
+        raise error from e
+
+
+def _log_media_fetch_failure(url: str, error: MediaLoadError) -> None:
+    log = (
+        logger.warning if isinstance(error, _MediaAddressBlockedError) else logger.info
+    )
+    log(
+        "Media URL fetch refused or failed: url=%s reason=%s",
+        redact_media_url(url),
+        error.log_detail,
+    )
+
+
+def _download_remote_media(url: str, timeout: float) -> bytes:
     session = get_mm_http_session()
     deadline = time.monotonic() + timeout
     current_url = url
@@ -147,16 +499,20 @@ def download_remote_media(url: str, timeout: float) -> bytes:
         # Validate the same normalized URL representation that requests sends
         # to urllib3. This avoids parser disagreements around backslashes and
         # userinfo separators.
-        prepared_url = requests.Request("GET", current_url).prepare().url
+        try:
+            prepared_url = requests.Request("GET", current_url).prepare().url
+        except (requests.exceptions.RequestException, ValueError) as e:
+            raise MediaURLNotAllowedError(
+                "Invalid media URL",
+                log_detail=f"invalid URL {redact_media_url(current_url)}",
+            ) from e
         if prepared_url is None:
-            raise ValueError(f"Invalid media URL: {current_url!r}")
+            raise MediaURLNotAllowedError("Invalid media URL")
         _assert_media_url_allowed(prepared_url)
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise requests.exceptions.Timeout(
-                f"Timed out while downloading media URL: {url}"
-            )
+            raise requests.exceptions.Timeout("media URL deadline exceeded")
 
         with session.get(
             prepared_url,
@@ -168,7 +524,7 @@ def download_remote_media(url: str, timeout: float) -> bytes:
             if response.status_code in _MEDIA_URL_REDIRECT_STATUS_CODES and location:
                 if redirect_count == _MAX_MEDIA_URL_REDIRECTS:
                     raise requests.exceptions.TooManyRedirects(
-                        f"Media URL exceeded {_MAX_MEDIA_URL_REDIRECTS} redirects: {url}"
+                        f"more than {_MAX_MEDIA_URL_REDIRECTS} redirects"
                     )
                 current_url = urljoin(response.url, location)
                 continue
@@ -182,7 +538,7 @@ def download_remote_media(url: str, timeout: float) -> bytes:
                 except ValueError:
                     declared_size = None
                 if declared_size is not None and declared_size > max_bytes:
-                    raise ValueError(
+                    raise MediaLoadError(
                         f"Remote media exceeds the {max_bytes} byte download limit"
                     )
 
@@ -191,11 +547,9 @@ def download_remote_media(url: str, timeout: float) -> bytes:
                 if not chunk:
                     continue
                 if time.monotonic() > deadline:
-                    raise requests.exceptions.Timeout(
-                        f"Timed out while downloading media URL: {url}"
-                    )
+                    raise requests.exceptions.Timeout("media URL deadline exceeded")
                 if max_bytes and len(content) + len(chunk) > max_bytes:
-                    raise ValueError(
+                    raise MediaLoadError(
                         f"Remote media exceeds the {max_bytes} byte download limit"
                     )
                 content.extend(chunk)
@@ -204,17 +558,52 @@ def download_remote_media(url: str, timeout: float) -> bytes:
     raise AssertionError("unreachable")
 
 
+def _ca_bundle_from_env() -> Union[str, bool]:
+    # trust_env=False also stops requests from reading these. They only choose
+    # which CAs to trust (never where to connect), so keep honoring them.
+    return (
+        os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE") or True
+    )
+
+
 def get_mm_http_session() -> requests.Session:
     """Per-thread HTTP session for multimodal downloads, to pool/reuse TCP
     connections. Pid-checked so a forked worker rebuilds its own, not the parent's.
+
+    Every connection the session opens goes through the connect-time address
+    check. ``trust_env`` is off so HTTP(S)_PROXY cannot route a download
+    around that check (and ``.netrc`` credentials are never sent to a
+    client-chosen host); TLS verification stays on.
     """
     pid = os.getpid()
     session = getattr(_mm_http_session, "session", None)
-    if session is None or getattr(_mm_http_session, "pid", None) != pid:
+    if (
+        session is None
+        or getattr(_mm_http_session, "pid", None) != pid
+        or getattr(_mm_http_session, "generation", None) != _media_url_policy_generation
+    ):
+        if session is not None and getattr(_mm_http_session, "pid", None) == pid:
+            session.close()  # drop connections opened under the old policy
         session = requests.Session()
+        session.trust_env = False
+        session.verify = _ca_bundle_from_env()
+        adapter = _MediaHTTPAdapter()
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
         _mm_http_session.session = session
         _mm_http_session.pid = pid
+        _mm_http_session.generation = _media_url_policy_generation
     return session
+
+
+def media_error_client_text(error: BaseException) -> str:
+    """The text of a ``CLIENT_MEDIA_EXCEPTIONS`` error that may be returned to
+    the client. A raw requests error (which names the URL and the connection
+    outcome) is replaced; ``download_remote_media`` already raises only
+    ``MediaLoadError``, so this guards callers that fetch some other way."""
+    if isinstance(error, requests.exceptions.RequestException):
+        return _MEDIA_FETCH_FAILED
+    return str(error)
 
 
 # Raised by the loaders below when client-supplied media cannot be fetched or

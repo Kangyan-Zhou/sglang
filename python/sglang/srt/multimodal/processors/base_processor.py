@@ -33,10 +33,13 @@ from sglang.srt.multimodal.cache import (
 )
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
+    MediaLoadError,
     configure_media_url_security,
+    describe_media_item,
     load_audio,
     load_image,
     load_video,
+    media_error_client_text,
     smart_to_rgb,
 )
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
@@ -274,6 +277,7 @@ class BaseMultimodalProcessor(ABC):
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
+            get_mm().media_url_allow_private_networks,
         )
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
@@ -1038,15 +1042,17 @@ class BaseMultimodalProcessor(ABC):
                 return load_audio(data, audio_sample_rate)
 
         except CLIENT_MEDIA_EXCEPTIONS as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise ValueError(f"Error while loading data {data_str}: {e}") from e
+            # The text reaches the client: describe_media_item drops URL
+            # userinfo and query, and fetch failures carry no connection detail.
+            raise MediaLoadError(
+                f"Error while loading data {describe_media_item(data)}: "
+                f"{media_error_client_text(e)}",
+                log_detail=getattr(e, "log_detail", None),
+            ) from e
         except Exception as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+            raise RuntimeError(
+                f"Error while loading data {describe_media_item(data)}: {e}"
+            ) from e
 
     @staticmethod
     def _get_preprocessed_input_format(data):

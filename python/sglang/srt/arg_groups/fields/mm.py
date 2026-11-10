@@ -96,6 +96,15 @@ class Mm(msgspec.Struct):
         "Maximum size in MiB for one client-supplied remote media download. "
         "The limit is enforced while streaming; set to 0 to disable it.",
     ] = 64
+    media_url_allow_private_networks: A[
+        bool,
+        "Allow client-supplied HTTP(S) media URLs to reach non-public "
+        "addresses: loopback, private, link-local (including cloud metadata "
+        "services), carrier-grade NAT and other reserved ranges. By default the "
+        "engine refuses them, checking the address it connects to on every "
+        "connection and redirect. Enable only for self-hosted internal media "
+        "hosts, together with --allowed-media-domains when clients are untrusted.",
+    ] = False
     mm_preprocess_cache_size_mb: A[
         Optional[int],
         Arg(

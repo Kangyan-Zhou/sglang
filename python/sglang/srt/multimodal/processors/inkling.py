@@ -39,7 +39,10 @@ from sglang.srt.multimodal.inkling import (
 )
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
+    MediaLoadError,
     download_remote_media,
+    media_error_client_text,
+    redact_media_url,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
@@ -88,11 +91,13 @@ def _resolve_media_item(item):
             )
         if url.startswith(("http://", "https://")):
             return download_remote_media(url, timeout=30)
+    except MediaLoadError:
+        raise  # already client-safe, and logged by download_remote_media
     except CLIENT_MEDIA_EXCEPTIONS as e:
-        url_str = url
-        if len(url_str) > 100:
-            url_str = url_str[:100] + "..."
-        raise ValueError(f"Error while resolving media {url_str}: {e}") from e
+        raise MediaLoadError(
+            f"Error while resolving media {redact_media_url(url)}: "
+            f"{media_error_client_text(e)}"
+        ) from e
     return url  # plain path / file:// -> handled by the per-modality byte loader
 
 

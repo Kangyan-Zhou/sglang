@@ -13,7 +13,10 @@ import threading
 import unittest
 from pathlib import Path
 
-from sglang.srt.multimodal.media_io import get_image_bytes
+from sglang.srt.multimodal.media_io import (
+    configure_media_url_security,
+    get_image_bytes,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -64,10 +67,14 @@ class TestRustMediaSourceLoading(CustomTestCase):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        # The Python reference refuses loopback by default; this test compares
+        # payloads, not the address policy.
+        configure_media_url_security([], allow_private_networks=True)
         try:
             url = f"http://127.0.0.1:{server.server_port}/image"
             self.assertEqual(bytes(FETCH(url)), get_image_bytes(url))
         finally:
+            configure_media_url_security([])
             server.shutdown()
             server.server_close()
             thread.join()

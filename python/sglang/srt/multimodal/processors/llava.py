@@ -5,7 +5,6 @@ from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Union
 
 import numpy as np
-import requests
 from transformers.models.auto.processing_auto import (
     PROCESSOR_MAPPING_NAMES as HF_MAPPING_NAMES,
 )
@@ -23,6 +22,7 @@ from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     ImageData,
+    MediaLoadError,
     get_image_bytes,
     load_image,
 )
@@ -115,11 +115,10 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 return await loop.run_in_executor(
                     self.io_executor, get_image_bytes, url
                 )
-            except (
-                requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError,
-            ):
-                if attempt >= max_retries:
+            except MediaLoadError as error:
+                # Only a connect/read failure is worth retrying; a refusal
+                # (policy, blocked address, HTTP status, size) is not.
+                if not error.transient or attempt >= max_retries:
                     raise
                 await asyncio.sleep(delay)
                 delay *= 2

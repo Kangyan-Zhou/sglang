@@ -206,6 +206,7 @@ def handle_media_url_security(server_args: Any):
         allowed_media_domains=configure_media_url_security(
             cfg.allowed_media_domains,
             cfg.media_url_max_file_size_mb,
+            cfg.media_url_allow_private_networks,
         ),
     )
 
