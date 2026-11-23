@@ -175,8 +175,8 @@ pub(crate) fn render(
     Ok((prompt, prefix))
 }
 
-/// `_prepare_kimi_k3_messages` on one dumped message, after
-/// `normalize_assistant_tool_call_arguments(strict=False)`.
+/// `_prepare_kimi_k3_messages` on one dumped message. SGLang hands the encoder
+/// string tool-call arguments as sent.
 fn prepare_message(mut message: Value) -> Result<Value, RenderError> {
     if let Some(parts) = message["content"].as_array_mut() {
         // Media expands into image tokens only on the engine.
@@ -195,15 +195,13 @@ fn prepare_message(mut message: Value) -> Result<Value, RenderError> {
         neutralize(reasoning);
     }
     for arguments in tool_arguments(&mut message) {
-        if let Some(object) = arguments
-            .as_str()
-            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .filter(Value::is_object)
-        {
-            *arguments = object;
-        }
-        // SGLang's encoder and Dynamo parse other text differently.
-        if arguments.as_str().is_some_and(|text| !text.is_empty()) {
+        // A JSON object string goes to Dynamo as sent: from a dynamo-renderer that
+        // keeps each value's source text (ai-dynamo/frontend-crates#608), the
+        // prompt matches the encoder's. SGLang's encoder and Dynamo parse other
+        // text differently.
+        if arguments.as_str().is_some_and(|text| {
+            !text.is_empty() && !serde_json::from_str::<Value>(text).is_ok_and(|v| v.is_object())
+        }) {
             return Err(RenderError::Declined("non-object tool arguments".into()));
         }
         neutralize(arguments);
