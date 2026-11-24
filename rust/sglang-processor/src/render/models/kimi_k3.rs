@@ -24,6 +24,25 @@ const TOKENIZER_ARGS: [&str; 8] = [
     "return_tensors",
 ];
 
+/// `serving_kimi_k3`'s `_map_kimi_k3_effort`: the OpenAI effort tiers mapped
+/// onto K3's levels, `None` for no effort or `"none"`. `"medium"` is K3's
+/// `"high"` but K3.1's own level, which Dynamo's formatter cannot render, so it
+/// is left to the engine, as is any effort the engine rejects.
+fn effort_level(effort: Option<&Value>) -> Result<Option<&'static str>, RenderError> {
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+    match effort.as_str() {
+        Some("none") => Ok(None),
+        Some("minimal" | "low") => Ok(Some("low")),
+        Some("high") => Ok(Some("high")),
+        Some("xhigh" | "max") => Ok(Some("max")),
+        _ => Err(RenderError::Declined(format!(
+            "Kimi K3 reasoning_effort {effort}"
+        ))),
+    }
+}
+
 /// Render an SGLang chat request body. Returns the prompt, whose segments keep
 /// the special-token boundaries, and the `continue_final_message` prefix,
 /// which SGLang tokenizes separately. A chat with media is declined: the
@@ -110,10 +129,7 @@ fn render_messages(
     // The tokenizer's default is `max`.
     let thinking_effort = match kwargs.get("thinking_effort") {
         Some(thinking_effort) => thinking_effort.clone(),
-        None => effort
-            .filter(|effort| supported(effort))
-            .cloned()
-            .unwrap_or_else(|| "max".into()),
+        None => effort_level(effort)?.unwrap_or("max").into(),
     };
     // `build_chat_segments` rejects other efforts; Dynamo cannot leave out a null one.
     if thinking && !supported(&thinking_effort) {
@@ -469,5 +485,50 @@ mod media_tests {
             render_with_media(video, &HashMap::new()),
             Err(RenderError::Declined(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    fn effort_of(request: Value) -> Result<String, RenderError> {
+        let (prompt, _) = render(request, &HashMap::new())?;
+        let text = prompt.as_str().to_owned();
+        let level = ["low", "medium", "high", "max"]
+            .into_iter()
+            .find(|level| text.contains(&format!("thinking_effort={level}`")))
+            .unwrap_or("absent");
+        Ok(level.to_owned())
+    }
+
+    fn chat(effort: Value) -> Value {
+        json!({"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": effort})
+    }
+
+    #[test]
+    fn openai_tiers_map_onto_k3_levels() {
+        for (tier, level) in [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+        ] {
+            assert_eq!(effort_of(chat(json!(tier))).unwrap(), level, "{tier}");
+        }
+    }
+
+    #[test]
+    fn medium_and_unknown_efforts_are_left_to_the_engine() {
+        for effort in [json!("medium"), json!("ultra"), json!(0.5)] {
+            assert!(
+                matches!(
+                    render(chat(effort.clone()), &HashMap::new()),
+                    Err(RenderError::Declined(_))
+                ),
+                "{effort}"
+            );
+        }
     }
 }
