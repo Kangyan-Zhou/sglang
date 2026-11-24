@@ -29,8 +29,8 @@ pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
     QWEN38_DEVELOPER_ERROR, deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3,
     is_qwen38, is_step3p5, preserve_messages, prints_arguments_as_xml, render_deepseek_v4,
-    render_glm53, render_kimi_k3, render_minimax_m3, render_qwen38, render_step3p5,
-    takes_content_parts,
+    render_glm53, render_kimi_k3, render_kimi_k3_with_media, render_minimax_m3, render_qwen38,
+    render_step3p5, takes_content_parts,
 };
 #[cfg(feature = "openai")]
 pub(crate) use self::models::{
@@ -111,6 +111,10 @@ pub enum ChatFormatter {
     },
     Legacy(Box<LegacyFormatter>),
 }
+
+/// A prompt rendered with one slot per image: the prompt, its template
+/// prefix, and the images' sources in slot order.
+pub type RenderedWithMedia = (RenderedPrompt, String, Vec<String>);
 
 impl ChatFormatter {
     /// Render the request's messages to a single prompt string.
@@ -330,6 +334,27 @@ impl ChatFormatter {
                 })
             });
         Some(encoded.map_err(|message| TemplateError::Renderer { message }))
+    }
+
+    /// Kimi K3's [`Self::render_request`] for a chat that may carry images: each
+    /// image is the `<|media_pad|>` slot SGLang's OpenAI layer renders for it,
+    /// and the images' sources come back in slot order. For routing only — the
+    /// engine expands every slot into the image's own tokens, so ids from this
+    /// prompt are the engine's up to the first image. `None` for other formatters.
+    pub fn render_multimodal_request(
+        &self,
+        request: Value,
+        default_kwargs: &HashMap<String, Value>,
+    ) -> Option<Result<RenderedWithMedia, TemplateError>> {
+        if !matches!(self, ChatFormatter::KimiK3) {
+            return None;
+        }
+        Some(
+            render_kimi_k3_with_media(request, default_kwargs).map_err(|error| match error {
+                RenderError::Declined(message) => TemplateError::NeedsRenderFallback { message },
+                RenderError::Failed(message) => TemplateError::Renderer { message },
+            }),
+        )
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`

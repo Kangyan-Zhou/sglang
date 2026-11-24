@@ -21,6 +21,7 @@ pub(crate) use self::deepseek_v4::{
 };
 pub(super) use self::glm53::{is_glm53, render as render_glm53};
 pub(super) use self::kimi_k3::render as render_kimi_k3;
+pub(super) use self::kimi_k3::render_with_media as render_kimi_k3_with_media;
 pub(super) use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
 pub(super) use self::minimax_m3::{
     is_minimax_m3, prints_arguments_as_xml, render as render_minimax_m3,

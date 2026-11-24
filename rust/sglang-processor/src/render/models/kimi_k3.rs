@@ -26,17 +26,41 @@ const TOKENIZER_ARGS: [&str; 8] = [
 
 /// Render an SGLang chat request body. Returns the prompt, whose segments keep
 /// the special-token boundaries, and the `continue_final_message` prefix,
-/// which SGLang tokenizes separately.
+/// which SGLang tokenizes separately. A chat with media is declined: the
+/// engine expands each image into tokens of its own.
 pub(crate) fn render(
+    request: Value,
+    defaults: &HashMap<String, Value>,
+) -> Result<(RenderedPrompt, String), RenderError> {
+    render_messages(request, defaults, None)
+}
+
+/// [`render`], keeping each image as the `<|media_pad|>` slot SGLang's OpenAI
+/// layer renders for it (`KIMI_K3_IMAGE_SLOT`), and returning the images'
+/// sources in slot order. For routing only: the engine expands every slot
+/// into the image's own tokens, so ids from this prompt are the engine's up to
+/// the first image and no further. Video and audio are still declined (the
+/// engine renders video as another slot).
+pub(crate) fn render_with_media(
+    request: Value,
+    defaults: &HashMap<String, Value>,
+) -> Result<crate::render::RenderedWithMedia, RenderError> {
+    let mut images = Vec::new();
+    let (prompt, prefix) = render_messages(request, defaults, Some(&mut images))?;
+    Ok((prompt, prefix, images))
+}
+
+fn render_messages(
     mut request: Value,
     defaults: &HashMap<String, Value>,
+    mut images: Option<&mut Vec<String>>,
 ) -> Result<(RenderedPrompt, String), RenderError> {
     let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
         return Err("messages must be an array".into());
     };
     let mut messages = messages
         .into_iter()
-        .map(|message| prepare_message(engine_message(message)))
+        .map(|message| prepare_message(engine_message(message), images.as_deref_mut()))
         .collect::<Result<Vec<_>, _>>()?;
     let request = &request;
     // `_handle_last_assistant_message`, which K3 runs only to continue the turn.
@@ -176,21 +200,58 @@ pub(crate) fn render(
 }
 
 /// `_prepare_kimi_k3_messages` on one dumped message. SGLang hands the encoder
-/// string tool-call arguments as sent.
-fn prepare_message(mut message: Value) -> Result<Value, RenderError> {
+/// string tool-call arguments as sent. `images` collects image sources in slot
+/// order, or declines a message with an image when `None`.
+fn prepare_message(
+    mut message: Value,
+    images: Option<&mut Vec<String>>,
+) -> Result<Value, RenderError> {
+    // Text is neutralized; an image's source is not (`_prepare_kimi_k3_messages`).
+    let mut neutralize_content = true;
     if let Some(parts) = message["content"].as_array_mut() {
-        // Media expands into image tokens only on the engine.
+        // The engine renders video as another slot and has no audio slot.
         if parts.iter().any(|part| {
             matches!(
                 part["type"].as_str(),
-                Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                Some("video_url" | "audio_url" | "input_audio")
             )
         }) {
             return Err(RenderError::Declined("Kimi K3 media".into()));
         }
-        parts.retain(|part| part["type"] == "text");
+        let is_image =
+            |part: &Value| matches!(part["type"].as_str(), Some("image_url" | "input_image"));
+        match images {
+            // Media expands into image tokens only on the engine.
+            None if parts.iter().any(is_image) => {
+                return Err(RenderError::Declined("Kimi K3 media".into()));
+            }
+            None => parts.retain(|part| part["type"] == "text"),
+            Some(images) => {
+                let mut kept = Vec::with_capacity(parts.len());
+                for part in parts.drain(..) {
+                    if part["type"] == "text" {
+                        let mut part = part;
+                        neutralize(&mut part);
+                        kept.push(part);
+                    } else if is_image(&part) {
+                        // `image_url` as an object or a bare string, as SGLang reads it.
+                        let image = match &part["image_url"] {
+                            Value::String(url) => json!({ "url": url }),
+                            Value::Null => json!({}),
+                            other => other.clone(),
+                        };
+                        images.push(image["url"].as_str().unwrap_or_default().to_owned());
+                        kept.push(json!({ "type": "image_url", "image_url": image }));
+                    }
+                }
+                *parts = kept;
+                neutralize_content = false;
+            }
+        }
     }
-    neutralize(&mut message["content"]);
+    if neutralize_content {
+        neutralize(&mut message["content"]);
+    }
     if let Some(reasoning) = message.get_mut("reasoning_content") {
         neutralize(reasoning);
     }
@@ -355,5 +416,58 @@ impl OAIChatLikeRequest for KimiRequest {
 
     fn chat_template_args(&self) -> Option<&HashMap<String, Value>> {
         Some(&self.args)
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+
+    fn chat() -> Value {
+        json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "look <|kimi_image_placeholder|>"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png?sig=1"}},
+                {"type": "image_url", "image_url": "https://example.com/b.png"},
+            ]},
+            {"role": "assistant", "content": "two cats"},
+            {"role": "user", "content": "which is older?"},
+        ]})
+    }
+
+    #[test]
+    fn render_declines_media_and_render_with_media_keeps_slots() {
+        assert!(matches!(
+            render(chat(), &HashMap::new()),
+            Err(RenderError::Declined(_))
+        ));
+        let (prompt, prefix, images) = render_with_media(chat(), &HashMap::new()).unwrap();
+        assert!(prefix.is_empty());
+        assert_eq!(
+            images,
+            [
+                "https://example.com/a.png?sig=1",
+                "https://example.com/b.png"
+            ]
+        );
+        let text = prompt.as_str();
+        assert_eq!(
+            text.matches("<|media_pad|>").count(),
+            2,
+            "one slot per image"
+        );
+        // Text is neutralized; image sources are not.
+        assert!(text.contains("<| kimi_image_placeholder |>"));
+        assert!(!text.contains("sig=1"), "sources do not reach the prompt");
+    }
+
+    #[test]
+    fn render_with_media_still_declines_video() {
+        let video = json!({"messages": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "https://example.com/v.mp4"}}]}]});
+        assert!(matches!(
+            render_with_media(video, &HashMap::new()),
+            Err(RenderError::Declined(_))
+        ));
     }
 }
